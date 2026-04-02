@@ -3,9 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InodeType {
-    Folder,
-    Message,
-    Thread,
+    Folder,      // General folders (root, inbox, search)
+    MessageDir,  // The [Date]_[Subject] directory
+    BodyMd,      // body.md inside MessageDir
+    BodyHtml,    // body.html inside MessageDir
+    SnippetTxt,  // snippet.txt inside MessageDir
+    MetadataJson,// metadata.json inside MessageDir
+    AttachmentsDir, // attachments/ folder
 }
 
 pub struct InodeStore {
@@ -26,7 +30,6 @@ impl InodeStore {
         let id_to_inode = DashMap::new();
         let inode_to_id = DashMap::new();
 
-        // Register static inodes
         id_to_inode.insert("inbox".to_string(), Self::INBOX);
         inode_to_id.insert(Self::INBOX, ("inbox".to_string(), InodeType::Folder));
 
@@ -50,12 +53,13 @@ impl InodeStore {
     }
 
     pub fn get_or_create_inode(&self, id: String, r#type: InodeType) -> u64 {
-        if let Some(inode) = self.id_to_inode.get(&id) {
+        let key = format!("{:?}:{}", r#type, id);
+        if let Some(inode) = self.id_to_inode.get(&key) {
             return *inode;
         }
 
         let inode = self.next_inode.fetch_add(1, Ordering::SeqCst);
-        self.id_to_inode.insert(id.clone(), inode);
+        self.id_to_inode.insert(key, inode);
         self.inode_to_id.insert(inode, (id, r#type));
         inode
     }
@@ -64,7 +68,8 @@ impl InodeStore {
         self.inode_to_id.get(&inode).map(|v| v.clone())
     }
 
-    pub fn get_inode(&self, id: &str) -> Option<u64> {
-        self.id_to_inode.get(id).map(|v| *v)
+    pub fn get_inode(&self, id: &str, r#type: InodeType) -> Option<u64> {
+        let key = format!("{:?}:{}", r#type, id);
+        self.id_to_inode.get(&key).map(|v| *v)
     }
 }

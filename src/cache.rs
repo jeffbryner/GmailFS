@@ -28,3 +28,26 @@ impl MetadataCache {
         self.cache.invalidate(&ino).await;
     }
 }
+
+pub struct BodyCache {
+    cache: Cache<u64, String>,
+}
+
+impl BodyCache {
+    pub fn new() -> Self {
+        Self {
+            cache: Cache::builder()
+                .time_to_live(Duration::from_secs(300)) // Cache bodies for 5 minutes
+                .max_capacity(100)
+                .build(),
+        }
+    }
+
+    pub async fn get(&self, ino: u64) -> Option<String> {
+        self.cache.get(&ino).await
+    }
+
+    pub async fn insert(&self, ino: u64, body: String) {
+        self.cache.insert(ino, body).await;
+    }
+}

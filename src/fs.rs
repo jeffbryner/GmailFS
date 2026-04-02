@@ -1,4 +1,4 @@
-use crate::cache::MetadataCache;
+use crate::cache::{MetadataCache, BodyCache};
 use crate::gmail::GmailClient;
 use crate::inode::{InodeStore, InodeType};
 use fuser::{
@@ -9,13 +9,16 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::runtime::Handle;
+use tracing::{debug, error, info};
 
 const TTL: Duration = Duration::from_secs(1); // 1 second TTL for attributes
+const PLACEHOLDER_SIZE: u64 = 64 * 1024; // 64KB placeholder
 
 pub struct GmailFS {
     pub client: Arc<GmailClient>,
     pub inodes: Arc<InodeStore>,
     pub metadata_cache: Arc<MetadataCache>,
+    pub body_cache: Arc<BodyCache>,
     pub handle: Handle,
 }
 
@@ -64,7 +67,7 @@ impl GmailFS {
         FileAttr {
             ino,
             size,
-            blocks: 1,
+            blocks: (size + 511) / 512,
             atime: UNIX_EPOCH,
             mtime: UNIX_EPOCH,
             ctime: UNIX_EPOCH,
@@ -81,7 +84,7 @@ impl GmailFS {
     }
 
     fn is_search_dir(&self, ino: u64) -> bool {
-        if let Some((_id, r#type)) = self.inodes.get_id(ino) {
+        if let Some((_, r#type)) = self.inodes.get_id(ino) {
             return r#type == InodeType::Folder && ino > 6;
         }
         false
@@ -91,6 +94,7 @@ impl GmailFS {
 impl Filesystem for GmailFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = name.to_string_lossy();
+        debug!("lookup: parent={} name={}", parent, name_str);
 
         if parent == InodeStore::ROOT {
             match name_str.as_ref() {
@@ -102,27 +106,57 @@ impl Filesystem for GmailFS {
                 _ => reply.error(ENOENT),
             }
         } else if parent == InodeStore::INBOX || self.is_search_dir(parent) {
-            if let Some(ino) = self.inodes.get_inode(&name_str) {
-                reply.entry(&TTL, &self.file_attr(ino, 0), 0);
+            // Looking for a message directory
+            if let Some(ino) = self.inodes.get_inode(&name_str, InodeType::MessageDir) {
+                reply.entry(&TTL, &self.dir_attr(ino), 0);
             } else {
                 reply.error(ENOENT);
             }
         } else if parent == InodeStore::SEARCH {
-            if let Some(ino) = self.inodes.get_inode(&name_str) {
+            if let Some(ino) = self.inodes.get_inode(&name_str, InodeType::Folder) {
                 reply.entry(&TTL, &self.dir_attr(ino), 0);
             } else {
                 reply.error(ENOENT);
             }
         } else {
-            reply.error(ENOENT);
+            // Could be a file inside a message directory
+            if let Some((msg_id, InodeType::MessageDir)) = self.inodes.get_id(parent) {
+                match name_str.as_ref() {
+                    "body.md" => {
+                        let ino = self.inodes.get_or_create_inode(msg_id, InodeType::BodyMd);
+                        reply.entry(&TTL, &self.file_attr(ino, PLACEHOLDER_SIZE), 0);
+                    }
+                    "body.html" => {
+                        let ino = self.inodes.get_or_create_inode(msg_id, InodeType::BodyHtml);
+                        reply.entry(&TTL, &self.file_attr(ino, PLACEHOLDER_SIZE), 0);
+                    }
+                    "snippet.txt" => {
+                        let ino = self.inodes.get_or_create_inode(msg_id, InodeType::SnippetTxt);
+                        reply.entry(&TTL, &self.file_attr(ino, PLACEHOLDER_SIZE), 0);
+                    }
+                    "metadata.json" => {
+                        let ino = self.inodes.get_or_create_inode(msg_id, InodeType::MetadataJson);
+                        reply.entry(&TTL, &self.file_attr(ino, PLACEHOLDER_SIZE), 0);
+                    }
+                    "attachments" => {
+                        let ino = self.inodes.get_or_create_inode(msg_id, InodeType::AttachmentsDir);
+                        reply.entry(&TTL, &self.dir_attr(ino), 0);
+                    }
+                    _ => reply.error(ENOENT),
+                }
+            } else {
+                reply.error(ENOENT);
+            }
         }
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        debug!("getattr: ino={}", ino);
         let handle = self.handle.clone();
-        let cache = self.metadata_cache.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let body_cache = self.body_cache.clone();
 
-        if let Some(attr) = handle.block_on(async { cache.get(ino).await }) {
+        if let Some(attr) = handle.block_on(async { metadata_cache.get(ino).await }) {
             reply.attr(&TTL, &attr);
             return;
         }
@@ -135,10 +169,17 @@ impl Filesystem for GmailFS {
             | InodeStore::ALL_MAIL
             | InodeStore::SEARCH => self.dir_attr(ino),
             _ => {
-                if let Some((_, r#type)) = self.inodes.get_id(ino) {
+                if let Some((id, r#type)) = self.inodes.get_id(ino) {
                     match r#type {
-                        InodeType::Folder => self.dir_attr(ino),
-                        InodeType::Message | InodeType::Thread => self.file_attr(ino, 0),
+                        InodeType::Folder | InodeType::MessageDir | InodeType::AttachmentsDir => self.dir_attr(ino),
+                        _ => {
+                            let size = if let Some(body) = handle.block_on(async { body_cache.get(ino).await }) {
+                                body.len() as u64
+                            } else {
+                                PLACEHOLDER_SIZE
+                            };
+                            self.file_attr(ino, size)
+                        }
                     }
                 } else {
                     reply.error(ENOENT);
@@ -147,7 +188,7 @@ impl Filesystem for GmailFS {
             }
         };
 
-        handle.block_on(async { cache.insert(ino, attr).await });
+        handle.block_on(async { metadata_cache.insert(ino, attr).await });
         reply.attr(&TTL, &attr);
     }
 
@@ -160,8 +201,9 @@ impl Filesystem for GmailFS {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let name_str = name.to_string_lossy().to_string();
+        info!("mkdir: parent={} name={}", parent, name_str);
         if parent == InodeStore::SEARCH {
-            let name_str = name.to_string_lossy().to_string();
             let ino = self.inodes.get_or_create_inode(name_str, InodeType::Folder);
             reply.entry(&TTL, &self.dir_attr(ino), 0);
         } else {
@@ -177,6 +219,7 @@ impl Filesystem for GmailFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        debug!("readdir: ino={} offset={}", ino, offset);
         if ino == InodeStore::ROOT {
             let entries = vec![
                 (InodeStore::ROOT, FileType::Directory, "."),
@@ -194,29 +237,40 @@ impl Filesystem for GmailFS {
                 }
             }
             reply.ok();
-        } else if ino == InodeStore::INBOX {
+        } else if ino == InodeStore::INBOX || self.is_search_dir(ino) {
             let handle = self.handle.clone();
             let client = self.client.clone();
             let inodes = self.inodes.clone();
 
-            let messages = handle.block_on(async { client.list_inbox_messages().await });
+            let messages = handle.block_on(async { 
+                if ino == InodeStore::INBOX {
+                    client.list_inbox_messages().await 
+                } else {
+                    let (query, _) = inodes.get_id(ino).unwrap();
+                    client.search_messages(&query).await
+                }
+            });
 
             match messages {
                 Ok(msgs) => {
                     let mut entries = vec![
                         (ino, FileType::Directory, ".".to_string()),
-                        (InodeStore::ROOT, FileType::Directory, "..".to_string()),
+                        (if ino == InodeStore::INBOX { InodeStore::ROOT } else { InodeStore::SEARCH }, FileType::Directory, "..".to_string()),
                     ];
 
                     for msg in msgs {
+                        // In a real impl, we'd fetch headers here to get the real display name.
+                        // For efficiency in listing, we'll use the ID-based display name from get_display_name
+                        // but note that get_display_name needs a full message object.
+                        // For now we use the ID as the directory name.
                         let msg_id = msg.id.unwrap_or_default();
-                        entries.push((0, FileType::RegularFile, msg_id));
+                        entries.push((0, FileType::Directory, msg_id));
                     }
 
                     for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
                         let mut entry_ino = entry.0;
                         if entry_ino == 0 {
-                            entry_ino = inodes.get_or_create_inode(entry.2.clone(), InodeType::Message);
+                            entry_ino = inodes.get_or_create_inode(entry.2.clone(), InodeType::MessageDir);
                         }
                         if reply.add(entry_ino, (i + 1) as i64, entry.1, &entry.2) {
                             break;
@@ -224,52 +278,39 @@ impl Filesystem for GmailFS {
                     }
                     reply.ok();
                 }
-                Err(_) => reply.error(libc::EIO),
+                Err(e) => {
+                    error!("readdir failed: {}", e);
+                    reply.error(libc::EIO);
+                }
             }
         } else if ino == InodeStore::SEARCH {
             if offset == 0 {
-                reply.add(ino, 1, FileType::Directory, ".");
-                reply.add(InodeStore::ROOT, 2, FileType::Directory, "..".to_string());
+                let _ = reply.add(ino, 1, FileType::Directory, ".");
+                let _ = reply.add(InodeStore::ROOT, 2, FileType::Directory, "..");
             }
             reply.ok();
-        } else if self.is_search_dir(ino) {
-            if let Some((query, _)) = self.inodes.get_id(ino) {
-                let handle = self.handle.clone();
-                let client = self.client.clone();
-                let inodes = self.inodes.clone();
+        } else {
+            // It's likely a MessageDir
+            if let Some((msg_id, InodeType::MessageDir)) = self.inodes.get_id(ino) {
+                let entries = vec![
+                    (ino, FileType::Directory, "."),
+                    (InodeStore::INBOX, FileType::Directory, ".."), // Simplified ..
+                    (self.inodes.get_or_create_inode(msg_id.clone(), InodeType::BodyMd), FileType::RegularFile, "body.md"),
+                    (self.inodes.get_or_create_inode(msg_id.clone(), InodeType::BodyHtml), FileType::RegularFile, "body.html"),
+                    (self.inodes.get_or_create_inode(msg_id.clone(), InodeType::SnippetTxt), FileType::RegularFile, "snippet.txt"),
+                    (self.inodes.get_or_create_inode(msg_id.clone(), InodeType::MetadataJson), FileType::RegularFile, "metadata.json"),
+                    (self.inodes.get_or_create_inode(msg_id.clone(), InodeType::AttachmentsDir), FileType::Directory, "attachments"),
+                ];
 
-                let messages = handle.block_on(async { client.search_messages(&query).await });
-
-                match messages {
-                    Ok(msgs) => {
-                        let mut entries = vec![
-                            (ino, FileType::Directory, ".".to_string()),
-                            (InodeStore::SEARCH, FileType::Directory, "..".to_string()),
-                        ];
-
-                        for msg in msgs {
-                            let msg_id = msg.id.unwrap_or_default();
-                            entries.push((0, FileType::RegularFile, msg_id));
-                        }
-
-                        for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                            let mut entry_ino = entry.0;
-                            if entry_ino == 0 {
-                                entry_ino = inodes.get_or_create_inode(entry.2.clone(), InodeType::Message);
-                            }
-                            if reply.add(entry_ino, (i + 1) as i64, entry.1, &entry.2) {
-                                break;
-                            }
-                        }
-                        reply.ok();
+                for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                    if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+                        break;
                     }
-                    Err(_) => reply.error(libc::EIO),
                 }
+                reply.ok();
             } else {
                 reply.error(ENOENT);
             }
-        } else {
-            reply.error(ENOENT);
         }
     }
 
@@ -285,26 +326,42 @@ impl Filesystem for GmailFS {
         reply: ReplyData,
     ) {
         if let Some((id, r#type)) = self.inodes.get_id(ino) {
-            if r#type == InodeType::Message {
-                let handle = self.handle.clone();
-                let client = self.client.clone();
+            let handle = self.handle.clone();
+            let client = self.client.clone();
+            let body_cache = self.body_cache.clone();
 
-                let message = handle.block_on(async { client.get_message_markdown(&id).await });
-
-                match message {
-                    Ok(markdown) => {
-                        let content = markdown.as_bytes();
-                        let end = std::cmp::min(offset as usize + size as usize, content.len());
-                        if offset as usize >= content.len() {
-                            reply.data(&[]);
-                        } else {
-                            reply.data(&content[offset as usize..end]);
-                        }
-                    }
-                    Err(_) => reply.error(libc::EIO),
-                }
+            let content_res = if let Some(cached) = handle.block_on(async { body_cache.get(ino).await }) {
+                Ok(cached)
             } else {
-                reply.error(libc::EISDIR);
+                let res = handle.block_on(async {
+                    match r#type {
+                        InodeType::BodyMd => client.get_message_markdown(&id).await,
+                        InodeType::BodyHtml => client.get_message_html(&id).await,
+                        InodeType::SnippetTxt => client.get_message_snippet(&id).await,
+                        InodeType::MetadataJson => client.get_message_metadata(&id).await,
+                        _ => Err(anyhow::anyhow!("Not a readable file type")),
+                    }
+                });
+                if let Ok(content) = &res {
+                    handle.block_on(async { body_cache.insert(ino, content.clone()).await });
+                }
+                res
+            };
+
+            match content_res {
+                Ok(content) => {
+                    let bytes = content.as_bytes();
+                    if offset >= bytes.len() as i64 {
+                        reply.data(&[]);
+                    } else {
+                        let end = std::cmp::min(offset as usize + size as usize, bytes.len());
+                        reply.data(&bytes[offset as usize..end]);
+                    }
+                }
+                Err(e) => {
+                    error!("read failed for ino={}: {}", ino, e);
+                    reply.error(libc::EIO);
+                }
             }
         } else {
             reply.error(ENOENT);

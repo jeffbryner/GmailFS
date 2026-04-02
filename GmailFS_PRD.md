@@ -127,6 +127,7 @@ Instead of one file per email, represent an email as a **directory** to give the
 └── 2024-04-02_Subject_Line/
     ├── body.md        <-- Primary choice (Markdown)
     ├── body.html      <-- Fallback (Raw HTML)
+    ├── snippet.txt    <-- Fallback snippet of text    
     ├── metadata.json  <-- Headers, Date, From, To
     └── attachments/
         └── invoice.pdf
