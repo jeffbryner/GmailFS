@@ -1,0 +1,26 @@
+[package]
+name = "gmailfs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fuser = "0.14"
+libc = "0.2"
+tokio = { version = "1.0", features = ["full"] }
+google-gmail1 = "6.0"
+yup-oauth2 = "11.0"
+hyper = "1.0"
+hyper-util = "0.1"
+hyper-rustls = "0.27"
+rustls = "0.23"
+moka = { version = "0.12", features = ["future"] }
+dashmap = "6.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures = "0.3"
+chrono = "0.4"
+base64 = "0.22"
+html2md = "0.2"
