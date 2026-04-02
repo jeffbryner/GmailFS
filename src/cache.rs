@@ -1,9 +1,9 @@
-use fuser::FileAttr;
 use moka::future::Cache;
 use std::time::Duration;
 
 pub struct MetadataCache {
-    cache: Cache<u64, FileAttr>,
+    // We'll store a simple size and is_dir bool for WebDAV
+    cache: Cache<String, (u64, bool)>,
 }
 
 impl MetadataCache {
@@ -16,38 +16,38 @@ impl MetadataCache {
         }
     }
 
-    pub async fn get(&self, ino: u64) -> Option<FileAttr> {
-        self.cache.get(&ino).await
+    pub async fn get(&self, path: String) -> Option<(u64, bool)> {
+        self.cache.get(&path).await
     }
 
-    pub async fn insert(&self, ino: u64, attr: FileAttr) {
-        self.cache.insert(ino, attr).await;
+    pub async fn insert(&self, path: String, val: (u64, bool)) {
+        self.cache.insert(path, val).await;
     }
 
-    pub async fn invalidate(&self, ino: u64) {
-        self.cache.invalidate(&ino).await;
+    pub async fn invalidate(&self, path: String) {
+        self.cache.invalidate(&path).await;
     }
 }
 
 pub struct BodyCache {
-    cache: Cache<u64, String>,
+    cache: Cache<String, String>,
 }
 
 impl BodyCache {
     pub fn new() -> Self {
         Self {
             cache: Cache::builder()
-                .time_to_live(Duration::from_secs(300)) // Cache bodies for 5 minutes
+                .time_to_live(Duration::from_secs(300))
                 .max_capacity(100)
                 .build(),
         }
     }
 
-    pub async fn get(&self, ino: u64) -> Option<String> {
-        self.cache.get(&ino).await
+    pub async fn get(&self, id: String) -> Option<String> {
+        self.cache.get(&id).await
     }
 
-    pub async fn insert(&self, ino: u64, body: String) {
-        self.cache.insert(ino, body).await;
+    pub async fn insert(&self, id: String, body: String) {
+        self.cache.insert(id, body).await;
     }
 }
