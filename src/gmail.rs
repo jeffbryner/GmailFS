@@ -66,15 +66,23 @@ impl GmailClient {
         google_gmail1::api::Scope::Modify.as_ref()
     }
 
-    pub async fn list_inbox_messages(&self, max: u32) -> anyhow::Result<Vec<Message>> {
-        debug!("Listing inbox messages (max {})", max);
+    pub async fn list_messages_with_label(&self, label_id: &str, max: u32) -> anyhow::Result<Vec<Message>> {
+        debug!("Listing messages with label {} (max {})", label_id, max);
         let (_, list) = self.hub.users().messages_list("me")
-            .add_label_ids("INBOX")
+            .add_label_ids(label_id)
             .max_results(max)
             .add_scope(Self::scope())
             .doit().await?;
         
         Ok(list.messages.unwrap_or_default())
+    }
+
+    pub async fn list_inbox_messages(&self, max: u32) -> anyhow::Result<Vec<Message>> {
+        self.list_messages_with_label("INBOX", max).await
+    }
+
+    pub async fn list_unread_messages(&self, max: u32) -> anyhow::Result<Vec<Message>> {
+        self.list_messages_with_label("UNREAD", max).await
     }
 
     pub async fn get_message(&self, id: &str) -> anyhow::Result<Arc<Message>> {

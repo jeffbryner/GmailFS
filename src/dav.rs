@@ -63,11 +63,11 @@ impl GmailDav {
 
         let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
         
-        let (msg_display_name, file_name, is_attachment) = if parts.len() == 3 && parts[0] == "inbox" {
+        let (msg_display_name, file_name, is_attachment) = if parts.len() == 3 && (parts[0] == "inbox" || parts[0] == "unread") {
             (parts[1], parts[2], false)
         } else if parts.len() == 4 && parts[0] == "search" {
             (parts[2], parts[3], false)
-        } else if parts.len() == 4 && parts[0] == "inbox" && parts[2] == "attachments" {
+        } else if parts.len() == 4 && (parts[0] == "inbox" || parts[0] == "unread") && parts[2] == "attachments" {
             (parts[1], parts[3], true)
         } else if parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments" {
             (parts[2], parts[4], true)
@@ -144,10 +144,14 @@ impl DavFileSystem for GmailDav {
             if parts.is_empty() {
                 entries.push(Box::new(GmailDavDirEntry::new("00_MOUNT_CHECK_OK", false)));
                 entries.push(Box::new(GmailDavDirEntry::new("inbox", true)));
+                entries.push(Box::new(GmailDavDirEntry::new("unread", true)));
                 entries.push(Box::new(GmailDavDirEntry::new("search", true)));
-            } else if parts[0] == "inbox" && parts.len() == 1 {
-                let message_stubs = self.client.list_inbox_messages(20).await
-                    .map_err(|_| FsError::GeneralFailure)?;
+            } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 1 {
+                let message_stubs = if parts[0] == "inbox" {
+                    self.client.list_inbox_messages(20).await
+                } else {
+                    self.client.list_unread_messages(20).await
+                }.map_err(|_| FsError::GeneralFailure)?;
                 
                 let mut detail_futures = futures::stream::iter(message_stubs)
                     .map(|stub| {
@@ -188,15 +192,15 @@ impl DavFileSystem for GmailDav {
                         entries.push(Box::new(GmailDavDirEntry::new(&display_name, true)));
                     }
                 }
-            } else if (parts[0] == "inbox" && parts.len() == 2) || (parts[0] == "search" && parts.len() == 3) {
+            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 2) || (parts[0] == "search" && parts.len() == 3) {
                 entries.push(Box::new(GmailDavDirEntry::new("body.md", false)));
                 entries.push(Box::new(GmailDavDirEntry::new("body.html", false)));
                 entries.push(Box::new(GmailDavDirEntry::new("snippet.txt", false)));
                 entries.push(Box::new(GmailDavDirEntry::new("metadata.json", false)));
                 entries.push(Box::new(GmailDavDirEntry::new("attachments", true)));
-            } else if (parts[0] == "inbox" && parts.len() == 3 && parts[2] == "attachments") || 
+            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3 && parts[2] == "attachments") || 
                       (parts[0] == "search" && parts.len() == 4 && parts[3] == "attachments") {
-                let msg_display_name = if parts[0] == "inbox" { parts[1] } else { parts[2] };
+                let msg_display_name = if parts[0] == "search" { parts[2] } else { parts[1] };
                 let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
                 let atts = self.client.get_attachments_list(&msg_id).await
                     .map_err(|_| FsError::GeneralFailure)?;
@@ -245,21 +249,21 @@ impl DavFileSystem for GmailDav {
 
             if parts.is_empty() {
                 is_dir = true;
-            } else if parts.len() == 1 && (parts[0] == "inbox" || parts[0] == "search") {
+            } else if parts.len() == 1 && (parts[0] == "inbox" || parts[0] == "unread" || parts[0] == "search") {
                 is_dir = true;
-            } else if parts[0] == "inbox" && parts.len() == 2 {
+            } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 2 {
                 is_dir = true;
             } else if parts[0] == "search" && parts.len() == 2 {
                 is_dir = parts[1] == "example-query" || self.active_searches.contains(parts[1]);
             } else if parts[0] == "search" && parts.len() == 3 {
                 is_dir = true;
-            } else if (parts.len() == 3 && parts[2] == "attachments") || (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments") {
+            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3 && parts[2] == "attachments") || (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments") {
                 is_dir = true;
             } else if parts.len() == 1 && parts[0] == "00_MOUNT_CHECK_OK" {
                 is_file = true;
-            } else if (parts.len() == 3 && parts[0] == "inbox") || (parts.len() == 4 && parts[0] == "search") {
+            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3) || (parts.len() == 4 && parts[0] == "search") {
                 is_file = true;
-            } else if (parts.len() == 4 && parts[0] == "inbox" && parts[2] == "attachments") || (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments") {
+            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 4 && parts[2] == "attachments") || (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments") {
                 is_file = true;
             }
 
@@ -270,7 +274,7 @@ impl DavFileSystem for GmailDav {
                     return Ok(Box::new(GmailDavMetaData::new(false, 2)) as Box<dyn DavMetaData>);
                 }
 
-                let (msg_display_name, file_name, is_attachment) = if parts.len() == 4 && parts[0] == "inbox" && parts[2] == "attachments" {
+                let (msg_display_name, file_name, is_attachment) = if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 4 && parts[2] == "attachments" {
                     (parts[1], parts[3], true)
                 } else if parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments" {
                     (parts[2], parts[4], true)
@@ -326,8 +330,8 @@ impl DavFileSystem for GmailDav {
                 self.active_searches.remove(parts[1]);
                 self.tombstones.insert(rel_path_str.to_string());
                 Ok(())
-            } else if (parts.len() == 2 && parts[0] == "inbox") || (parts.len() == 3 && parts[0] == "search") {
-                let msg_display_name = if parts[0] == "inbox" { parts[1] } else { parts[2] };
+            } else if (parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread")) || (parts.len() == 3 && parts[0] == "search") {
+                let msg_display_name = if parts[0] == "search" { parts[2] } else { parts[1] };
                 let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
                 self.client.trash_message(&msg_id).await.map_err(|e| {
                     error!("Trash failed: {}", e);
@@ -335,11 +339,10 @@ impl DavFileSystem for GmailDav {
                 })?;
                 
                 self.tombstones.insert(rel_path_str.to_string());
-                // Clean up any child tombstones for this folder
                 let child_prefix = format!("{}/", rel_path_str);
                 self.tombstones.retain(|p| !p.starts_with(&child_prefix));
                 Ok(())
-            } else if (parts.len() == 3 && parts[0] == "inbox" && parts[2] == "attachments") ||
+            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3 && parts[2] == "attachments") ||
                       (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments") {
                 self.tombstones.insert(rel_path_str.to_string());
                 Ok(())
@@ -356,9 +359,9 @@ impl DavFileSystem for GmailDav {
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             info!("remove_file: path={:?} parts={:?}", rel_path, parts);
 
-            if (parts.len() == 3 && parts[0] == "inbox") || 
+            if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3) || 
                (parts.len() == 4 && parts[0] == "search") ||
-               (parts.len() == 4 && parts[0] == "inbox" && parts[2] == "attachments") ||
+               ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 4 && parts[2] == "attachments") ||
                (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments") {
                 self.tombstones.insert(rel_path_str.to_string());
                 Ok(())
@@ -373,7 +376,7 @@ impl DavFileSystem for GmailDav {
             let rel_path = from.as_rel_ospath();
             let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
             
-            if parts.len() == 2 && parts[0] == "inbox" {
+            if parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread") {
                 let msg_id = self.resolve_id(parts[1]).ok_or(FsError::NotFound)?;
                 self.client.archive_message(&msg_id).await.map_err(|_| FsError::GeneralFailure)?;
                 Ok(())
