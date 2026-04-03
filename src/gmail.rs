@@ -3,9 +3,17 @@ use google_gmail1::Gmail;
 use google_gmail1::{yup_oauth2, common};
 use google_gmail1::hyper_util::client::legacy::Client;
 use google_gmail1::hyper_util::client::legacy::connect::HttpConnector;
-use tracing::debug;
+use tracing::{debug, warn};
 use serde_json::json;
 use chrono::DateTime;
+use bytes::Bytes;
+
+#[derive(Debug, Clone)]
+pub struct AttachmentMeta {
+    pub name: String,
+    pub attachment_id: String,
+    pub size: u64,
+}
 
 pub struct GmailClient {
     hub: Gmail<google_gmail1::hyper_rustls::HttpsConnector<HttpConnector>>,
@@ -56,6 +64,49 @@ impl GmailClient {
             .add_scope(google_gmail1::api::Scope::Readonly.as_ref())
             .doit().await?;
         Ok(msg)
+    }
+
+    pub async fn get_attachments_list(&self, id: &str) -> anyhow::Result<Vec<AttachmentMeta>> {
+        let msg = self.get_message(id).await?;
+        let mut list = Vec::new();
+        if let Some(payload) = msg.payload {
+            self.find_attachments(&payload, &mut list);
+        }
+        Ok(list)
+    }
+
+    fn find_attachments(&self, part: &google_gmail1::api::MessagePart, list: &mut Vec<AttachmentMeta>) {
+        if let (Some(filename), Some(body)) = (&part.filename, &part.body) {
+            if let Some(attachment_id) = &body.attachment_id {
+                if !filename.is_empty() {
+                    list.push(AttachmentMeta {
+                        name: filename.clone(),
+                        attachment_id: attachment_id.clone(),
+                        size: body.size.unwrap_or(0) as u64,
+                    });
+                }
+            }
+        }
+        if let Some(parts) = &part.parts {
+            for p in parts {
+                self.find_attachments(p, list);
+            }
+        }
+    }
+
+    pub async fn get_attachment_data(&self, message_id: &str, attachment_id: &str) -> anyhow::Result<Bytes> {
+        debug!("Downloading attachment {} from message {}", attachment_id, message_id);
+        let (_, body) = self.hub.users().messages_attachments_get("me", message_id, attachment_id)
+            .add_scope(google_gmail1::api::Scope::Readonly.as_ref())
+            .doit().await?;
+        
+        if let Some(data) = body.data {
+            use base64::Engine as _;
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data)?;
+            Ok(Bytes::from(decoded))
+        } else {
+            Err(anyhow::anyhow!("No data in attachment response"))
+        }
     }
 
     pub async fn get_message_markdown(&self, id: &str) -> anyhow::Result<String> {
@@ -164,6 +215,13 @@ impl GmailClient {
     }
 
     fn extract_part(&self, part: &google_gmail1::api::MessagePart) -> String {
+        // Skip parts that are clearly attachments
+        if part.filename.is_some() && !part.filename.as_ref().unwrap().is_empty() {
+            return String::new();
+        }
+
+        let mime_type = part.mime_type.as_deref().unwrap_or("text/plain");
+        
         if let Some(body) = &part.body {
             if let Some(data) = &body.data {
                 if !data.is_empty() {
