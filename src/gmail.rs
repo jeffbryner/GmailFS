@@ -62,12 +62,16 @@ impl GmailClient {
         Ok(Self { hub, message_cache })
     }
 
+    fn scope() -> &'static str {
+        google_gmail1::api::Scope::Modify.as_ref()
+    }
+
     pub async fn list_inbox_messages(&self, max: u32) -> anyhow::Result<Vec<Message>> {
         debug!("Listing inbox messages (max {})", max);
         let (_, list) = self.hub.users().messages_list("me")
             .add_label_ids("INBOX")
             .max_results(max)
-            .add_scope(google_gmail1::api::Scope::Readonly.as_ref())
+            .add_scope(Self::scope())
             .doit().await?;
         
         Ok(list.messages.unwrap_or_default())
@@ -81,12 +85,35 @@ impl GmailClient {
         debug!("Fetching message {} from Gmail API", id);
         let (_, msg) = self.hub.users().messages_get("me", id)
             .format("full")
-            .add_scope(google_gmail1::api::Scope::Readonly.as_ref())
+            .add_scope(Self::scope())
             .doit().await?;
         
         let msg = Arc::new(msg);
         self.message_cache.insert(id.to_string(), msg.clone()).await;
         Ok(msg)
+    }
+
+    pub async fn trash_message(&self, id: &str) -> anyhow::Result<()> {
+        debug!("Trashing message {}", id);
+        self.hub.users().messages_trash("me", id)
+            .add_scope(Self::scope())
+            .doit().await?;
+        self.message_cache.invalidate(id).await;
+        Ok(())
+    }
+
+    pub async fn archive_message(&self, id: &str) -> anyhow::Result<()> {
+        debug!("Archiving message {} (removing INBOX label)", id);
+        let req = google_gmail1::api::BatchModifyMessagesRequest {
+            add_label_ids: None,
+            ids: Some(vec![id.to_string()]),
+            remove_label_ids: Some(vec!["INBOX".to_string()]),
+        };
+        self.hub.users().messages_batch_modify(req, "me")
+            .add_scope(Self::scope())
+            .doit().await?;
+        self.message_cache.invalidate(id).await;
+        Ok(())
     }
 
     pub async fn get_attachments_list(&self, id: &str) -> anyhow::Result<Vec<AttachmentMeta>> {
@@ -120,11 +147,10 @@ impl GmailClient {
     pub async fn get_attachment_data(&self, message_id: &str, attachment_id: &str) -> anyhow::Result<Bytes> {
         debug!("Downloading attachment {} from message {}", attachment_id, message_id);
         let (_, body) = self.hub.users().messages_attachments_get("me", message_id, attachment_id)
-            .add_scope(google_gmail1::api::Scope::Readonly.as_ref())
+            .add_scope(Self::scope())
             .doit().await?;
         
         if let Some(data) = body.data {
-            // The library already decodes base64url into Vec<u8>
             Ok(Bytes::copy_from_slice(&data))
         } else {
             Err(anyhow::anyhow!("No data in attachment response"))
@@ -237,7 +263,6 @@ impl GmailClient {
     }
 
     fn extract_part(&self, part: &google_gmail1::api::MessagePart) -> String {
-        // Skip parts that are clearly attachments
         if part.filename.is_some() && !part.filename.as_ref().unwrap().is_empty() {
             return String::new();
         }
@@ -245,7 +270,6 @@ impl GmailClient {
         if let Some(body) = &part.body {
             if let Some(data) = &body.data {
                 if !data.is_empty() {
-                    // Library already decodes the data from base64url
                     return String::from_utf8_lossy(data).to_string();
                 }
             }
@@ -279,7 +303,7 @@ impl GmailClient {
     pub async fn search_messages(&self, query: &str) -> anyhow::Result<Vec<Message>> {
         let (_, list) = self.hub.users().messages_list("me")
             .q(query)
-            .add_scope(google_gmail1::api::Scope::Readonly.as_ref())
+            .add_scope(Self::scope())
             .doit().await?;
         
         Ok(list.messages.unwrap_or_default())

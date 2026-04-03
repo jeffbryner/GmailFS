@@ -18,6 +18,8 @@ pub struct GmailDav {
     body_cache: Arc<BodyCache>,
     path_to_id: Arc<DashMap<String, String>>,
     active_searches: Arc<DashSet<String>>,
+    // Paths that have been "virtually deleted" by the OS
+    tombstones: Arc<DashSet<String>>,
 }
 
 impl fmt::Debug for GmailDav {
@@ -35,6 +37,7 @@ impl GmailDav {
             body_cache,
             path_to_id: Arc::new(DashMap::new()),
             active_searches: Arc::new(DashSet::new()),
+            tombstones: Arc::new(DashSet::new()),
         }
     }
 
@@ -54,6 +57,10 @@ impl GmailDav {
 
     async fn get_content_bytes(&self, path: &DavPath) -> FsResult<Bytes> {
         let rel_path = path.as_rel_ospath();
+        if self.tombstones.contains(rel_path.to_str().unwrap_or("")) {
+            return Err(FsError::NotFound);
+        }
+
         let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
         
         let (msg_display_name, file_name, is_attachment) = if parts.len() == 3 && parts[0] == "inbox" {
@@ -110,33 +117,12 @@ impl GmailDav {
 impl DavFileSystem for GmailDav {
     fn open<'a>(&'a self, path: &'a DavPath, _options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
-            let rel_path = path.as_rel_ospath();
-            let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
-            
-            let mut size = None;
-            let (msg_display_name, file_name, is_attachment) = if parts.len() == 4 && parts[0] == "inbox" && parts[2] == "attachments" {
-                (parts[1], parts[3], true)
-            } else if parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments" {
-                (parts[2], parts[4], true)
-            } else {
-                ("", "", false)
-            };
-
-            if is_attachment {
-                if let Some(msg_id) = self.resolve_id(msg_display_name) {
-                    if let Ok(atts) = self.client.get_attachments_list(&msg_id).await {
-                        if let Some(att) = atts.into_iter().find(|a| a.name == file_name) {
-                            size = Some(att.size);
-                        }
-                    }
-                }
-            }
-
+            let content = self.get_content_bytes(path).await?;
             Ok(Box::new(GmailDavFile { 
                 dav: self.clone(), 
                 path: path.clone(), 
-                content: None, 
-                size,
+                content: Some(content), 
+                size: None,
                 pos: 0 
             }) as Box<dyn DavFile>)
         }.boxed()
@@ -149,7 +135,8 @@ impl DavFileSystem for GmailDav {
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         async move {
             let rel_path = path.as_rel_ospath();
-            let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
+            let rel_path_str = rel_path.to_str().unwrap_or("");
+            let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             info!("read_dir: path={:?} parts={:?}", rel_path, parts);
 
             let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
@@ -218,7 +205,19 @@ impl DavFileSystem for GmailDav {
                 }
             }
 
-            let stream = futures::stream::iter(entries.into_iter().map(Ok));
+            // Filter out tombstones
+            let tombstones = self.tombstones.clone();
+            let filtered_entries: Vec<_> = entries.into_iter().filter(|e| {
+                let name = String::from_utf8_lossy(&e.name()).to_string();
+                let full_child_path = if rel_path_str.is_empty() {
+                    name
+                } else {
+                    format!("{}/{}", rel_path_str, name)
+                };
+                !tombstones.contains(&full_child_path)
+            }).collect();
+
+            let stream = futures::stream::iter(filtered_entries.into_iter().map(Ok));
             Ok(Box::pin(stream) as FsStream<Box<dyn DavDirEntry>>)
         }.boxed()
     }
@@ -226,7 +225,13 @@ impl DavFileSystem for GmailDav {
     fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         async move {
             let rel_path = path.as_rel_ospath();
-            let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
+            let rel_path_str = rel_path.to_str().unwrap_or("");
+            
+            if self.tombstones.contains(rel_path_str) {
+                return Err(FsError::NotFound);
+            }
+
+            let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
 
             if !parts.is_empty() {
                 let last = parts.last().unwrap();
@@ -291,9 +296,11 @@ impl DavFileSystem for GmailDav {
     fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         async move {
             let rel_path = path.as_rel_ospath();
-            let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
+            let rel_path_str = rel_path.to_str().unwrap_or("");
+            let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             
             info!("create_dir: path={:?} parts={:?}", rel_path, parts);
+            self.tombstones.remove(rel_path_str);
 
             if parts.len() == 2 && parts[0] == "search" {
                 let query = parts[1].to_string();
@@ -301,6 +308,74 @@ impl DavFileSystem for GmailDav {
                     info!("Registered magic search node: {}", query);
                     self.active_searches.insert(query);
                 }
+                Ok(())
+            } else {
+                Err(FsError::Forbidden)
+            }
+        }.boxed()
+    }
+
+    fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
+        async move {
+            let rel_path = path.as_rel_ospath();
+            let rel_path_str = rel_path.to_str().unwrap_or("");
+            let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
+            info!("remove_dir: path={:?} parts={:?}", rel_path, parts);
+
+            if parts.len() == 2 && parts[0] == "search" {
+                self.active_searches.remove(parts[1]);
+                self.tombstones.insert(rel_path_str.to_string());
+                Ok(())
+            } else if (parts.len() == 2 && parts[0] == "inbox") || (parts.len() == 3 && parts[0] == "search") {
+                let msg_display_name = if parts[0] == "inbox" { parts[1] } else { parts[2] };
+                let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
+                self.client.trash_message(&msg_id).await.map_err(|e| {
+                    error!("Trash failed: {}", e);
+                    FsError::GeneralFailure
+                })?;
+                
+                self.tombstones.insert(rel_path_str.to_string());
+                // Clean up any child tombstones for this folder
+                let child_prefix = format!("{}/", rel_path_str);
+                self.tombstones.retain(|p| !p.starts_with(&child_prefix));
+                Ok(())
+            } else if (parts.len() == 3 && parts[0] == "inbox" && parts[2] == "attachments") ||
+                      (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments") {
+                self.tombstones.insert(rel_path_str.to_string());
+                Ok(())
+            } else {
+                Err(FsError::Forbidden)
+            }
+        }.boxed()
+    }
+
+    fn remove_file<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
+        async move {
+            let rel_path = path.as_rel_ospath();
+            let rel_path_str = rel_path.to_str().unwrap_or("");
+            let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
+            info!("remove_file: path={:?} parts={:?}", rel_path, parts);
+
+            if (parts.len() == 3 && parts[0] == "inbox") || 
+               (parts.len() == 4 && parts[0] == "search") ||
+               (parts.len() == 4 && parts[0] == "inbox" && parts[2] == "attachments") ||
+               (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments") {
+                self.tombstones.insert(rel_path_str.to_string());
+                Ok(())
+            } else {
+                Err(FsError::Forbidden)
+            }
+        }.boxed()
+    }
+
+    fn rename<'a>(&'a self, from: &'a DavPath, _to: &'a DavPath) -> FsFuture<'a, ()> {
+        async move {
+            let rel_path = from.as_rel_ospath();
+            let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
+            
+            if parts.len() == 2 && parts[0] == "inbox" {
+                let msg_id = self.resolve_id(parts[1]).ok_or(FsError::NotFound)?;
+                self.client.archive_message(&msg_id).await.map_err(|_| FsError::GeneralFailure)?;
                 Ok(())
             } else {
                 Err(FsError::Forbidden)
