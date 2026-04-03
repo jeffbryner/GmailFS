@@ -6,7 +6,7 @@ use dav_server::davpath::DavPath;
 use futures::future::FutureExt;
 use crate::gmail::GmailClient;
 use crate::cache::BodyCache;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use futures::stream::StreamExt;
@@ -198,11 +198,12 @@ impl DavFileSystem for GmailDav {
 
             if parts.len() == 2 && parts[0] == "search" {
                 let query = parts[1].to_string();
-                if self.active_searches.contains(&query) {
-                    return Err(FsError::Exists);
+                if !self.active_searches.contains(&query) {
+                    info!("Registered magic search node: {}", query);
+                    self.active_searches.insert(query);
+                } else {
+                    debug!("Search node already exists: {}", query);
                 }
-                info!("Registered magic search node: {}", query);
-                self.active_searches.insert(query);
                 Ok(())
             } else {
                 Err(FsError::Forbidden)
