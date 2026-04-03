@@ -57,11 +57,12 @@ impl GmailDav {
 
     async fn get_content_bytes(&self, path: &DavPath) -> FsResult<Bytes> {
         let rel_path = path.as_rel_ospath();
-        if self.tombstones.contains(rel_path.to_str().unwrap_or("")) {
+        let rel_path_str = rel_path.to_str().unwrap_or("");
+        if self.tombstones.contains(rel_path_str) {
             return Err(FsError::NotFound);
         }
 
-        let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
         
         let (msg_display_name, file_name, is_attachment) = if parts.len() == 3 && (parts[0] == "inbox" || parts[0] == "unread") {
             (parts[1], parts[2], false)
@@ -210,7 +211,6 @@ impl DavFileSystem for GmailDav {
             }
 
             // Filter out tombstones
-            let tombstones = self.tombstones.clone();
             let filtered_entries: Vec<_> = entries.into_iter().filter(|e| {
                 let name = String::from_utf8_lossy(&e.name()).to_string();
                 let full_child_path = if rel_path_str.is_empty() {
@@ -218,7 +218,7 @@ impl DavFileSystem for GmailDav {
                 } else {
                     format!("{}/{}", rel_path_str, name)
                 };
-                !tombstones.contains(&full_child_path)
+                !self.tombstones.contains(&full_child_path)
             }).collect();
 
             let stream = futures::stream::iter(filtered_entries.into_iter().map(Ok));
@@ -289,8 +289,9 @@ impl DavFileSystem for GmailDav {
                     return Ok(Box::new(GmailDavMetaData::new(false, att.size)) as Box<dyn DavMetaData>);
                 }
 
-                let content = self.get_content_bytes(path).await?;
-                Ok(Box::new(GmailDavMetaData::new(false, content.len() as u64)) as Box<dyn DavMetaData>)
+                // Optimization: return a dummy size for text files to avoid blocking metadata calls
+                // The actual size will be provided when the file is opened.
+                Ok(Box::new(GmailDavMetaData::new(false, 1024)) as Box<dyn DavMetaData>)
             } else {
                 Err(FsError::NotFound)
             }
@@ -339,8 +340,14 @@ impl DavFileSystem for GmailDav {
                 })?;
                 
                 self.tombstones.insert(rel_path_str.to_string());
-                let child_prefix = format!("{}/", rel_path_str);
-                self.tombstones.retain(|p| !p.starts_with(&child_prefix));
+                // Manual cleanup of child tombstones
+                let to_remove: Vec<String> = self.tombstones.iter()
+                    .filter(|p| p.starts_with(&format!("{}/", rel_path_str)))
+                    .map(|p| p.clone())
+                    .collect();
+                for p in to_remove {
+                    self.tombstones.remove(&p);
+                }
                 Ok(())
             } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3 && parts[2] == "attachments") ||
                       (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments") {
