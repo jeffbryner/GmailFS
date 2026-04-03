@@ -3,8 +3,9 @@ use google_gmail1::Gmail;
 use google_gmail1::{yup_oauth2, common};
 use google_gmail1::hyper_util::client::legacy::Client;
 use google_gmail1::hyper_util::client::legacy::connect::HttpConnector;
-use tracing::{debug, warn};
+use tracing::debug;
 use serde_json::json;
+use chrono::DateTime;
 
 pub struct GmailClient {
     hub: Gmail<google_gmail1::hyper_rustls::HttpsConnector<HttpConnector>>,
@@ -37,10 +38,11 @@ impl GmailClient {
         Ok(Self { hub })
     }
 
-    pub async fn list_inbox_messages(&self) -> anyhow::Result<Vec<Message>> {
-        debug!("Listing inbox messages");
+    pub async fn list_inbox_messages(&self, max: u32) -> anyhow::Result<Vec<Message>> {
+        debug!("Listing inbox messages (max {})", max);
         let (_, list) = self.hub.users().messages_list("me")
             .add_label_ids("INBOX")
+            .max_results(max)
             .add_scope(google_gmail1::api::Scope::Readonly.as_ref())
             .doit().await?;
         
@@ -108,7 +110,7 @@ impl GmailClient {
     }
 
     pub fn get_display_name(&self, msg: &Message) -> String {
-        let mut date = "UnknownDate".to_string();
+        let mut date_str = "0000-00-00".to_string();
         let mut subject = "NoSubject".to_string();
 
         if let Some(payload) = &msg.payload {
@@ -117,15 +119,31 @@ impl GmailClient {
                     match h.name.as_deref() {
                         Some("Date") => {
                             if let Some(val) = &h.value {
-                                // Simplify date for filename: Tue, 1 Apr 2026 -> 2026-04-01
-                                date = val.clone(); 
+                                if let Ok(dt) = DateTime::parse_from_rfc2822(val) {
+                                    date_str = dt.format("%Y-%m-%d").to_string();
+                                }
                             }
                         }
                         Some("Subject") => {
                             if let Some(val) = &h.value {
-                                subject = val.chars()
+                                let raw_subject = val.chars()
                                     .map(|c| if c.is_alphanumeric() { c } else { '_' })
                                     .collect::<String>();
+                                
+                                let mut collapsed = String::new();
+                                let mut last_was_underscore = false;
+                                for c in raw_subject.chars() {
+                                    if c == '_' {
+                                        if !last_was_underscore {
+                                            collapsed.push(c);
+                                            last_was_underscore = true;
+                                        }
+                                    } else {
+                                        collapsed.push(c);
+                                        last_was_underscore = false;
+                                    }
+                                }
+                                subject = collapsed.trim_matches('_').to_string();
                             }
                         }
                         _ => {}
@@ -134,9 +152,8 @@ impl GmailClient {
             }
         }
 
-        // Limit subject length
         subject.truncate(50);
-        format!("{}_{}", msg.id.as_deref().unwrap_or("unknown"), subject)
+        format!("{}_{}_{}", date_str, subject, msg.id.as_deref().unwrap_or("unknown"))
     }
 
     fn extract_body(&self, msg: &Message) -> String {
@@ -147,8 +164,6 @@ impl GmailClient {
     }
 
     fn extract_part(&self, part: &google_gmail1::api::MessagePart) -> String {
-        let mime_type = part.mime_type.as_deref().unwrap_or("text/plain");
-        
         if let Some(body) = &part.body {
             if let Some(data) = &body.data {
                 if !data.is_empty() {
@@ -185,8 +200,11 @@ impl GmailClient {
                 }
             }
             for p in parts {
-                let res = self.extract_part(p);
-                if !res.is_empty() { return res; }
+                let sub_mime = p.mime_type.as_deref().unwrap_or("");
+                if sub_mime.starts_with("multipart/") {
+                    let res = self.extract_part(p);
+                    if !res.is_empty() { return res; }
+                }
             }
         }
 

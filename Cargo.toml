@@ -4,14 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-fuser = "0.14"
-libc = "0.2"
 tokio = { version = "1.0", features = ["full"] }
 google-gmail1 = "7.0.0+20251215"
-hyper = "1.0"
-hyper-util = "0.1"
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
 hyper-rustls = "0.27"
-rustls = "0.23"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 moka = { version = "0.12", features = ["future"] }
 dashmap = "6.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -24,3 +22,7 @@ chrono = "0.4"
 base64 = "0.22"
 html2md = "0.2"
 ammonia = "4.0"
+dav-server = { version = "0.7", features = ["hyper"] }
+headers = "0.4"
+bytes = "1.0"
+http-body-util = "0.1"
