@@ -10,6 +10,7 @@ use tracing::{error, info, debug};
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use futures::stream::StreamExt;
+use std::fmt;
 
 #[derive(Clone)]
 pub struct GmailDav {
@@ -17,6 +18,14 @@ pub struct GmailDav {
     body_cache: Arc<BodyCache>,
     path_to_id: Arc<DashMap<String, String>>,
     active_searches: Arc<DashSet<String>>,
+}
+
+impl fmt::Debug for GmailDav {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GmailDav")
+            .field("active_searches", &self.active_searches)
+            .finish()
+    }
 }
 
 impl GmailDav {
@@ -61,41 +70,75 @@ impl GmailDav {
 
         let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
         
-        if is_attachment {
-            let atts = self.client.get_attachments_list(&msg_id).await
-                .map_err(|_| FsError::GeneralFailure)?;
-            let att = atts.into_iter().find(|a| a.name == file_name).ok_or(FsError::NotFound)?;
-            return self.client.get_attachment_data(&msg_id, &att.attachment_id).await
-                .map_err(|_| FsError::GeneralFailure);
-        }
+        let cache_key = if is_attachment {
+            format!("{}:att:{}", msg_id, file_name)
+        } else {
+            format!("{}:{}", msg_id, file_name)
+        };
 
-        let cache_key = format!("{}:{}", msg_id, file_name);
-        if let Some(cached) = self.body_cache.get(cache_key.clone()).await {
-            return Ok(Bytes::from(cached));
-        }
+        let client = self.client.clone();
+        let msg_id_clone = msg_id.clone();
+        let file_name_clone = file_name.to_string();
 
-        let res = match file_name {
-            "body.md" => self.client.get_message_markdown(&msg_id).await
-                .map_err(|e| { error!("MD fetch failed: {}", e); FsError::GeneralFailure }),
-            "body.html" => self.client.get_message_html(&msg_id).await
-                .map_err(|_| FsError::GeneralFailure),
-            "snippet.txt" => self.client.get_message_snippet(&msg_id).await
-                .map_err(|_| FsError::GeneralFailure),
-            "metadata.json" => self.client.get_message_metadata(&msg_id).await
-                .map_err(|_| FsError::GeneralFailure),
-            _ => Err(FsError::NotFound),
-        }?;
-
-        self.body_cache.insert(cache_key, res.clone()).await;
-        Ok(Bytes::from(res))
+        self.body_cache.get_or_insert_with(cache_key.clone(), move || async move {
+            if is_attachment {
+                info!("Starting live download for attachment: {} from message {}", file_name_clone, msg_id_clone);
+                let atts = client.get_attachments_list(&msg_id_clone).await
+                    .map_err(|e| { error!("Failed to list attachments: {}", e); FsError::GeneralFailure })?;
+                let att = atts.into_iter().find(|a| a.name == file_name_clone).ok_or(FsError::NotFound)?;
+                let data = client.get_attachment_data(&msg_id_clone, &att.attachment_id).await
+                    .map_err(|e| { error!("Attachment download failed: {}", e); FsError::GeneralFailure })?;
+                info!("Download complete: {} bytes", data.len());
+                Ok(data)
+            } else {
+                match file_name_clone.as_str() {
+                    "body.md" => client.get_message_markdown_bytes(&msg_id_clone).await
+                        .map_err(|e| { error!("MD fetch failed: {}", e); FsError::GeneralFailure }),
+                    "body.html" => client.get_message_html_bytes(&msg_id_clone).await
+                        .map_err(|_| FsError::GeneralFailure),
+                    "snippet.txt" => client.get_message_snippet_bytes(&msg_id_clone).await
+                        .map_err(|_| FsError::GeneralFailure),
+                    "metadata.json" => client.get_message_metadata_bytes(&msg_id_clone).await
+                        .map_err(|_| FsError::GeneralFailure),
+                    _ => Err(FsError::NotFound),
+                }
+            }
+        }).await
     }
 }
 
 impl DavFileSystem for GmailDav {
     fn open<'a>(&'a self, path: &'a DavPath, _options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
-            let content = self.get_content_bytes(path).await?;
-            Ok(Box::new(GmailDavFile { content }) as Box<dyn DavFile>)
+            let rel_path = path.as_rel_ospath();
+            let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
+            
+            let mut size = None;
+            let (msg_display_name, file_name, is_attachment) = if parts.len() == 4 && parts[0] == "inbox" && parts[2] == "attachments" {
+                (parts[1], parts[3], true)
+            } else if parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments" {
+                (parts[2], parts[4], true)
+            } else {
+                ("", "", false)
+            };
+
+            if is_attachment {
+                if let Some(msg_id) = self.resolve_id(msg_display_name) {
+                    if let Ok(atts) = self.client.get_attachments_list(&msg_id).await {
+                        if let Some(att) = atts.into_iter().find(|a| a.name == file_name) {
+                            size = Some(att.size);
+                        }
+                    }
+                }
+            }
+
+            Ok(Box::new(GmailDavFile { 
+                dav: self.clone(), 
+                path: path.clone(), 
+                content: None, 
+                size,
+                pos: 0 
+            }) as Box<dyn DavFile>)
         }.boxed()
     }
 
@@ -185,7 +228,6 @@ impl DavFileSystem for GmailDav {
             let rel_path = path.as_rel_ospath();
             let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
 
-            // Ignore macOS metadata files explicitly
             if !parts.is_empty() {
                 let last = parts.last().unwrap();
                 if last.starts_with("._") || *last == ".DS_Store" {
@@ -216,8 +258,6 @@ impl DavFileSystem for GmailDav {
                 is_file = true;
             }
 
-            info!("metadata: path={:?} parts={:?} is_dir={} is_file={}", rel_path, parts, is_dir, is_file);
-
             if is_dir {
                 Ok(Box::new(GmailDavMetaData::new(true, 0)) as Box<dyn DavMetaData>)
             } else if is_file {
@@ -225,9 +265,9 @@ impl DavFileSystem for GmailDav {
                     return Ok(Box::new(GmailDavMetaData::new(false, 2)) as Box<dyn DavMetaData>);
                 }
 
-                let (msg_display_name, file_name, is_attachment) = if parts.len() == 4 && parts[0] == "inbox" {
+                let (msg_display_name, file_name, is_attachment) = if parts.len() == 4 && parts[0] == "inbox" && parts[2] == "attachments" {
                     (parts[1], parts[3], true)
-                } else if parts.len() == 5 && parts[0] == "search" {
+                } else if parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments" {
                     (parts[2], parts[4], true)
                 } else {
                     ("", "", false)
@@ -309,13 +349,25 @@ impl DavDirEntry for GmailDavDirEntry {
 
 #[derive(Debug)]
 struct GmailDavFile {
-    content: Bytes,
+    dav: GmailDav,
+    path: DavPath,
+    content: Option<Bytes>,
+    size: Option<u64>,
+    pos: usize,
 }
 
 impl DavFile for GmailDavFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         async move {
-            Ok(Box::new(GmailDavMetaData::new(false, self.content.len() as u64)) as Box<dyn DavMetaData>)
+            if let Some(content) = &self.content {
+                Ok(Box::new(GmailDavMetaData::new(false, content.len() as u64)) as Box<dyn DavMetaData>)
+            } else if let Some(size) = self.size {
+                Ok(Box::new(GmailDavMetaData::new(false, size)) as Box<dyn DavMetaData>)
+            } else {
+                let content = self.dav.get_content_bytes(&self.path).await?;
+                let size = content.len() as u64;
+                Ok(Box::new(GmailDavMetaData::new(false, size)) as Box<dyn DavMetaData>)
+            }
         }.boxed()
     }
 
@@ -329,13 +381,37 @@ impl DavFile for GmailDavFile {
 
     fn read_bytes(&mut self, count: usize) -> FsFuture<'_, Bytes> {
         async move {
-            let end = std::cmp::min(count, self.content.len());
-            Ok(self.content.slice(..end))
+            if self.content.is_none() {
+                self.content = Some(self.dav.get_content_bytes(&self.path).await?);
+            }
+            let content = self.content.as_ref().unwrap();
+            let start = self.pos;
+            let end = std::cmp::min(start + count, content.len());
+            let chunk = content.slice(start..end);
+            self.pos = end;
+            debug!("read_bytes: pos={} count={} returning={}", start, count, chunk.len());
+            Ok(chunk)
         }.boxed()
     }
 
-    fn seek(&mut self, _pos: SeekFrom) -> FsFuture<'_, u64> {
-        async move { Ok(0) }.boxed()
+    fn seek(&mut self, pos: SeekFrom) -> FsFuture<'_, u64> {
+        async move {
+            if self.content.is_none() {
+                self.content = Some(self.dav.get_content_bytes(&self.path).await?);
+            }
+            let content = self.content.as_ref().unwrap();
+            let new_pos = match pos {
+                SeekFrom::Start(p) => p as i64,
+                SeekFrom::Current(p) => self.pos as i64 + p,
+                SeekFrom::End(p) => content.len() as i64 + p,
+            };
+            if new_pos < 0 {
+                return Err(FsError::Forbidden);
+            }
+            self.pos = std::cmp::min(new_pos as usize, content.len());
+            debug!("seek: new_pos={}", self.pos);
+            Ok(self.pos as u64)
+        }.boxed()
     }
 
     fn flush(&mut self) -> FsFuture<'_, ()> {

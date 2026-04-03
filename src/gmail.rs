@@ -7,6 +7,10 @@ use tracing::debug;
 use serde_json::json;
 use chrono::DateTime;
 use bytes::Bytes;
+use moka::future::Cache;
+use std::time::Duration;
+use std::sync::Arc;
+use std::fmt;
 
 #[derive(Debug, Clone)]
 pub struct AttachmentMeta {
@@ -17,6 +21,13 @@ pub struct AttachmentMeta {
 
 pub struct GmailClient {
     hub: Gmail<google_gmail1::hyper_rustls::HttpsConnector<HttpConnector>>,
+    message_cache: Cache<String, Arc<Message>>,
+}
+
+impl fmt::Debug for GmailClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GmailClient").finish()
+    }
 }
 
 impl GmailClient {
@@ -43,7 +54,12 @@ impl GmailClient {
         .await?;
 
         let hub = Gmail::new(hub_client, auth);
-        Ok(Self { hub })
+        let message_cache = Cache::builder()
+            .time_to_live(Duration::from_secs(60))
+            .max_capacity(100)
+            .build();
+
+        Ok(Self { hub, message_cache })
     }
 
     pub async fn list_inbox_messages(&self, max: u32) -> anyhow::Result<Vec<Message>> {
@@ -57,20 +73,27 @@ impl GmailClient {
         Ok(list.messages.unwrap_or_default())
     }
 
-    pub async fn get_message(&self, id: &str) -> anyhow::Result<Message> {
-        debug!("Fetching message {}", id);
+    pub async fn get_message(&self, id: &str) -> anyhow::Result<Arc<Message>> {
+        if let Some(msg) = self.message_cache.get(id).await {
+            return Ok(msg);
+        }
+
+        debug!("Fetching message {} from Gmail API", id);
         let (_, msg) = self.hub.users().messages_get("me", id)
             .format("full")
             .add_scope(google_gmail1::api::Scope::Readonly.as_ref())
             .doit().await?;
+        
+        let msg = Arc::new(msg);
+        self.message_cache.insert(id.to_string(), msg.clone()).await;
         Ok(msg)
     }
 
     pub async fn get_attachments_list(&self, id: &str) -> anyhow::Result<Vec<AttachmentMeta>> {
         let msg = self.get_message(id).await?;
         let mut list = Vec::new();
-        if let Some(payload) = msg.payload {
-            self.find_attachments(&payload, &mut list);
+        if let Some(payload) = &msg.payload {
+            self.find_attachments(payload, &mut list);
         }
         Ok(list)
     }
@@ -101,15 +124,14 @@ impl GmailClient {
             .doit().await?;
         
         if let Some(data) = body.data {
-            use base64::Engine as _;
-            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data)?;
-            Ok(Bytes::from(decoded))
+            // The library already decodes base64url into Vec<u8>
+            Ok(Bytes::copy_from_slice(&data))
         } else {
             Err(anyhow::anyhow!("No data in attachment response"))
         }
     }
 
-    pub async fn get_message_markdown(&self, id: &str) -> anyhow::Result<String> {
+    pub async fn get_message_markdown_bytes(&self, id: &str) -> anyhow::Result<Bytes> {
         let msg = self.get_message(id).await?;
         let body = self.extract_body(&msg);
         
@@ -123,20 +145,20 @@ impl GmailClient {
         if !result.ends_with('\n') {
             result.push('\n');
         }
-        Ok(result)
+        Ok(Bytes::from(result))
     }
 
-    pub async fn get_message_html(&self, id: &str) -> anyhow::Result<String> {
+    pub async fn get_message_html_bytes(&self, id: &str) -> anyhow::Result<Bytes> {
         let msg = self.get_message(id).await?;
-        Ok(self.extract_body(&msg))
+        Ok(Bytes::from(self.extract_body(&msg)))
     }
 
-    pub async fn get_message_snippet(&self, id: &str) -> anyhow::Result<String> {
+    pub async fn get_message_snippet_bytes(&self, id: &str) -> anyhow::Result<Bytes> {
         let msg = self.get_message(id).await?;
-        Ok(msg.snippet.unwrap_or_default())
+        Ok(Bytes::from(msg.snippet.clone().unwrap_or_default()))
     }
 
-    pub async fn get_message_metadata(&self, id: &str) -> anyhow::Result<String> {
+    pub async fn get_message_metadata_bytes(&self, id: &str) -> anyhow::Result<Bytes> {
         let msg = self.get_message(id).await?;
         let mut metadata = json!({
             "id": msg.id,
@@ -145,11 +167,11 @@ impl GmailClient {
             "internalDate": msg.internal_date,
         });
 
-        if let Some(payload) = msg.payload {
-            if let Some(headers) = payload.headers {
+        if let Some(payload) = &msg.payload {
+            if let Some(headers) = &payload.headers {
                 let mut h_map = json!({});
                 for h in headers {
-                    if let (Some(name), Some(value)) = (h.name, h.value) {
+                    if let (Some(name), Some(value)) = (&h.name, &h.value) {
                         h_map[name] = json!(value);
                     }
                 }
@@ -157,7 +179,7 @@ impl GmailClient {
             }
         }
 
-        Ok(serde_json::to_string_pretty(&metadata)?)
+        Ok(Bytes::from(serde_json::to_string_pretty(&metadata)?))
     }
 
     pub fn get_display_name(&self, msg: &Message) -> String {
@@ -223,21 +245,8 @@ impl GmailClient {
         if let Some(body) = &part.body {
             if let Some(data) = &body.data {
                 if !data.is_empty() {
-                    if data.starts_with(b"<") || data.contains(&b'\n') || data.contains(&b' ') {
-                        return String::from_utf8_lossy(data).to_string();
-                    }
-
-                    use base64::Engine as _;
-                    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-                    match engine.decode(data) {
-                        Ok(decoded) => {
-                            let content = String::from_utf8_lossy(&decoded).to_string();
-                            if !content.is_empty() { return content; }
-                        }
-                        Err(_) => {
-                            return String::from_utf8_lossy(data).to_string();
-                        }
-                    }
+                    // Library already decodes the data from base64url
+                    return String::from_utf8_lossy(data).to_string();
                 }
             }
         }
