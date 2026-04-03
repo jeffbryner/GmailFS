@@ -3,7 +3,7 @@ use google_gmail1::Gmail;
 use google_gmail1::{yup_oauth2, common};
 use google_gmail1::hyper_util::client::legacy::Client;
 use google_gmail1::hyper_util::client::legacy::connect::HttpConnector;
-use tracing::{debug, warn};
+use tracing::debug;
 use serde_json::json;
 use chrono::DateTime;
 use bytes::Bytes;
@@ -220,8 +220,6 @@ impl GmailClient {
             return String::new();
         }
 
-        let mime_type = part.mime_type.as_deref().unwrap_or("text/plain");
-        
         if let Some(body) = &part.body {
             if let Some(data) = &body.data {
                 if !data.is_empty() {
