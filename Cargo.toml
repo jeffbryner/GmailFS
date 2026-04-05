@@ -22,8 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 futures = "0.3"
 chrono = "0.4"
 base64 = "0.22"
-html2md = "0.2"
-ammonia = "4.0"
+htmd = "0.5.4"
 dav-server = { version = "0.7", features = ["hyper"] }
 headers = "0.4"
 bytes = "1.0"

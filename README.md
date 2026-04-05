@@ -112,5 +112,12 @@ cp inbox/[email_dir]/attachments/report.pdf ~/Desktop/
 └── 00_MOUNT_CHECK_OK       # Verification file
 ```
 
+## Claude tip: 
+Claude's tools tend to keep files open and not close them which can exhaust open file handles. Prompt it with something like: 
+
+```
+❯  hey, this directory is a mounted filesystem representation of my gmail. Please use only bash commands (not your file tools) when using it to limit open files.
+```
+
 ## License
 Mozilla Public License Version 2.0

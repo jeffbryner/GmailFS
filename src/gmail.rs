@@ -233,8 +233,11 @@ impl GmailClient {
         } else {
             let body_clone = body.clone();
             let task = tokio::task::spawn_blocking(move || {
-                let cleaned = ammonia::clean(&body_clone);
-                html2md::parse_html(&cleaned)
+                htmd::HtmlToMarkdown::builder()
+                    .skip_tags(vec!["script", "style"])
+                    .build()
+                    .convert(&body_clone)
+                    .unwrap_or_else(|_| "Error converting HTML to Markdown".to_string())
             });
 
             match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
