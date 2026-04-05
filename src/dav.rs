@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, Duration};
 use std::io::SeekFrom;
 use dav_server::fs::*;
 use dav_server::davpath::DavPath;
@@ -20,6 +20,8 @@ pub struct GmailDav {
     path_to_id: Arc<DashMap<String, String>>,
     active_searches: Arc<DashSet<String>>,
     tombstones: Arc<DashSet<String>>,
+    // Cache for directory listings: Path -> (List of names, Timestamp)
+    listing_cache: Arc<DashMap<String, (Vec<String>, SystemTime)>>,
 }
 
 impl fmt::Debug for GmailDav {
@@ -38,6 +40,7 @@ impl GmailDav {
             path_to_id: Arc::new(DashMap::new()),
             active_searches: Arc::new(DashSet::new()),
             tombstones: Arc::new(DashSet::new()),
+            listing_cache: Arc::new(DashMap::new()),
         }
     }
 
@@ -154,6 +157,28 @@ impl DavFileSystem for GmailDav {
             let rel_path = path.as_rel_ospath();
             let rel_path_str = rel_path.to_str().unwrap_or("");
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
+            
+            // Check listing cache (10 second TTL)
+            if let Some(cached) = self.listing_cache.get(rel_path_str) {
+                let (names, ts) = cached.value();
+                if ts.elapsed().unwrap_or(Duration::from_secs(999)) < Duration::from_secs(10) {
+                    debug!("Serving read_dir from cache: {}", rel_path_str);
+                    let entries: Vec<Box<dyn DavDirEntry>> = names.iter().map(|n| {
+                        // We need to know if it was a dir or file. 
+                        // Heuristic: top levels and email folders are dirs.
+                        let is_dir = if parts.is_empty() || (parts.len() == 1 && (parts[0] == "inbox" || parts[0] == "unread" || parts[0] == "search" || parts[0] == "outbox")) {
+                            true
+                        } else {
+                            !n.ends_with(".md") && !n.ends_with(".html") && !n.ends_with(".json") && !n.ends_with(".txt")
+                        };
+                        Box::new(GmailDavDirEntry::new(n, is_dir)) as Box<dyn DavDirEntry>
+                    }).collect();
+                    
+                    let stream = futures::stream::iter(entries.into_iter().map(Ok));
+                    return Ok(Box::pin(stream) as FsStream<Box<dyn DavDirEntry>>);
+                }
+            }
+
             info!("read_dir: path={:?} parts={:?}", rel_path, parts);
 
             let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
@@ -186,7 +211,7 @@ impl DavFileSystem for GmailDav {
                     }
                 }
             } else if parts[0] == "outbox" && parts.len() == 1 {
-                // Outbox is normally empty until someone writes to it
+                // Outbox empty
             } else if parts[0] == "search" && parts.len() == 1 {
                 entries.push(Box::new(GmailDavDirEntry::new("example-query", true)));
                 for query in self.active_searches.iter() {
@@ -194,7 +219,6 @@ impl DavFileSystem for GmailDav {
                 }
             } else if parts[0] == "search" && parts.len() == 2 {
                 let query = parts[1];
-                info!("Executing live search for: {}", query);
                 let message_stubs = self.client.search_messages(query).await
                     .map_err(|_| FsError::GeneralFailure)?;
                 
@@ -229,6 +253,8 @@ impl DavFileSystem for GmailDav {
                 }
             }
 
+            // Filter out tombstones and update cache
+            let tombstones = self.tombstones.clone();
             let filtered_entries: Vec<_> = entries.into_iter().filter(|e| {
                 let name = String::from_utf8_lossy(&e.name()).to_string();
                 let full_child_path = if rel_path_str.is_empty() {
@@ -236,8 +262,11 @@ impl DavFileSystem for GmailDav {
                 } else {
                     format!("{}/{}", rel_path_str, name)
                 };
-                !self.tombstones.contains(&full_child_path)
+                !tombstones.contains(&full_child_path)
             }).collect();
+
+            let names: Vec<String> = filtered_entries.iter().map(|e| String::from_utf8_lossy(&e.name()).to_string()).collect();
+            self.listing_cache.insert(rel_path_str.to_string(), (names, SystemTime::now()));
 
             let stream = futures::stream::iter(filtered_entries.into_iter().map(Ok));
             Ok(Box::pin(stream) as FsStream<Box<dyn DavDirEntry>>)
@@ -313,6 +342,16 @@ impl DavFileSystem for GmailDav {
                     return Ok(Box::new(GmailDavMetaData::new(false, att.size)) as Box<dyn DavMetaData>);
                 }
 
+                // Check body cache for real size before falling back to dummy
+                let msg_display_name_view = if parts.len() == 3 { parts[1] } else { parts[2] };
+                let file_name_view = if parts.len() == 3 { parts[2] } else { parts[3] };
+                if let Some(msg_id) = self.resolve_id(msg_display_name_view) {
+                    let cache_key = format!("{}:{}", msg_id, file_name_view);
+                    if let Some(cached) = self.body_cache.get(cache_key).await {
+                        return Ok(Box::new(GmailDavMetaData::new(false, cached.len() as u64)) as Box<dyn DavMetaData>);
+                    }
+                }
+
                 Ok(Box::new(GmailDavMetaData::new(false, 1024)) as Box<dyn DavMetaData>)
             } else {
                 Err(FsError::NotFound)
@@ -328,6 +367,7 @@ impl DavFileSystem for GmailDav {
             
             info!("create_dir: path={:?} parts={:?}", rel_path, parts);
             self.tombstones.remove(rel_path_str);
+            self.listing_cache.clear(); // Invalidate all listings
 
             if parts.len() == 2 && parts[0] == "search" {
                 let query = parts[1].to_string();
@@ -348,6 +388,7 @@ impl DavFileSystem for GmailDav {
             let rel_path_str = rel_path.to_str().unwrap_or("");
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             info!("remove_dir: path={:?} parts={:?}", rel_path, parts);
+            self.listing_cache.clear();
 
             if parts.len() == 2 && parts[0] == "search" {
                 self.active_searches.remove(parts[1]);
@@ -386,6 +427,7 @@ impl DavFileSystem for GmailDav {
             let rel_path_str = rel_path.to_str().unwrap_or("");
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             info!("remove_file: path={:?} parts={:?}", rel_path, parts);
+            self.listing_cache.clear();
 
             if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3) || 
                (parts.len() == 4 && parts[0] == "search") ||
@@ -404,6 +446,7 @@ impl DavFileSystem for GmailDav {
         async move {
             let rel_path = from.as_rel_ospath();
             let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
+            self.listing_cache.clear();
             
             if parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread") {
                 let msg_id = self.resolve_id(parts[1]).ok_or(FsError::NotFound)?;

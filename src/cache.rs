@@ -25,6 +25,10 @@ impl BodyCache {
         }
     }
 
+    pub async fn get(&self, id: String) -> Option<Bytes> {
+        self.cache.get(&id).await
+    }
+
     pub async fn get_or_insert_with<F, Fut>(&self, key: String, f: F) -> FsResult<Bytes>
     where
         F: FnOnce() -> Fut,
@@ -39,5 +43,9 @@ impl BodyCache {
         } else {
             Ok(res)
         }
+    }
+
+    pub async fn insert(&self, id: String, data: Bytes) {
+        self.cache.insert(id, data).await;
     }
 }

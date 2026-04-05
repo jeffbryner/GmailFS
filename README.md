@@ -96,7 +96,17 @@ cp inbox/[email_dir]/attachments/report.pdf ~/Desktop/
 
 ---
 
-## 3. Directory Structure
+## 3. Troubleshooting
+
+### "Too many open files" error
+On macOS, the default limit for open files is often low. If you encounter this error, increase the limit in your terminal before running the daemon:
+```bash
+ulimit -n 4096
+```
+
+---
+
+## 4. Directory Structure
 ```text
 /tmp/gmail/
 ├── inbox/                  # Your Inbox

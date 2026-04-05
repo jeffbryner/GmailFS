@@ -1,7 +1,6 @@
 use google_gmail1::api::Message;
 use google_gmail1::Gmail;
 use google_gmail1::{yup_oauth2, common};
-use google_gmail1::hyper_util::client::legacy::Client;
 use google_gmail1::hyper_util::client::legacy::connect::HttpConnector;
 use tracing::debug;
 use serde_json::json;
@@ -14,6 +13,7 @@ use std::fmt;
 use mail_builder::MessageBuilder;
 use std::io::Cursor;
 use mime::Mime;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone)]
 pub struct AttachmentMeta {
@@ -25,6 +25,8 @@ pub struct AttachmentMeta {
 pub struct GmailClient {
     hub: Gmail<google_gmail1::hyper_rustls::HttpsConnector<HttpConnector>>,
     message_cache: Cache<String, Arc<Message>>,
+    // Global limit on concurrent API calls to prevent FD exhaustion
+    semaphore: Arc<Semaphore>,
 }
 
 impl fmt::Debug for GmailClient {
@@ -34,23 +36,15 @@ impl fmt::Debug for GmailClient {
 }
 
 impl GmailClient {
-    pub async fn new(secret: yup_oauth2::ApplicationSecret) -> anyhow::Result<Self> {
-        let connector = google_gmail1::hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()?
-            .https_only()
-            .enable_http1()
-            .build();
-        
-        let executor = google_gmail1::hyper_util::rt::TokioExecutor::new();
-        
-        let auth_client = Client::builder(executor.clone()).build(connector.clone());
-        let hub_client: common::Client<google_gmail1::hyper_rustls::HttpsConnector<HttpConnector>> = 
-            Client::builder(executor).build(connector);
-
+    pub async fn new(
+        secret: yup_oauth2::ApplicationSecret,
+        hub_client: common::Client<google_gmail1::hyper_rustls::HttpsConnector<HttpConnector>>,
+        auth_client_builder: yup_oauth2::client::CustomHyperClientBuilder<google_gmail1::hyper_rustls::HttpsConnector<HttpConnector>>,
+    ) -> anyhow::Result<Self> {
         let auth = yup_oauth2::InstalledFlowAuthenticator::with_client(
             secret,
             yup_oauth2::InstalledFlowReturnMethod::HTTPRedirect,
-            yup_oauth2::client::CustomHyperClientBuilder::from(auth_client),
+            auth_client_builder,
         )
         .persist_tokens_to_disk("gmailfs_tokens.json")
         .build()
@@ -62,7 +56,11 @@ impl GmailClient {
             .max_capacity(100)
             .build();
 
-        Ok(Self { hub, message_cache })
+        Ok(Self { 
+            hub, 
+            message_cache,
+            semaphore: Arc::new(Semaphore::new(20)),
+        })
     }
 
     fn scopes() -> Vec<&'static str> {
@@ -73,6 +71,7 @@ impl GmailClient {
     }
 
     pub async fn list_messages_with_label(&self, label_id: &str, max: u32) -> anyhow::Result<Vec<Message>> {
+        let _permit = self.semaphore.acquire().await?;
         debug!("Listing messages with label {} (max {})", label_id, max);
         let mut request = self.hub.users().messages_list("me")
             .add_label_ids(label_id)
@@ -99,6 +98,7 @@ impl GmailClient {
             return Ok(msg);
         }
 
+        let _permit = self.semaphore.acquire().await?;
         debug!("Fetching message {} from Gmail API", id);
         let mut request = self.hub.users().messages_get("me", id)
             .format("full");
@@ -114,6 +114,7 @@ impl GmailClient {
     }
 
     pub async fn trash_message(&self, id: &str) -> anyhow::Result<()> {
+        let _permit = self.semaphore.acquire().await?;
         debug!("Trashing message {}", id);
         let mut request = self.hub.users().messages_trash("me", id);
         for scope in Self::scopes() {
@@ -125,6 +126,7 @@ impl GmailClient {
     }
 
     pub async fn archive_message(&self, id: &str) -> anyhow::Result<()> {
+        let _permit = self.semaphore.acquire().await?;
         debug!("Archiving message {} (removing INBOX label)", id);
         let req = google_gmail1::api::BatchModifyMessagesRequest {
             add_label_ids: None,
@@ -141,6 +143,7 @@ impl GmailClient {
     }
 
     pub async fn send_email(&self, to: &str, subject: &str, body: &str) -> anyhow::Result<()> {
+        let _permit = self.semaphore.acquire().await?;
         debug!("Sending email to: {}, subject: {}", to, subject);
         
         let mut builder = MessageBuilder::new();
@@ -191,6 +194,7 @@ impl GmailClient {
     }
 
     pub async fn get_attachment_data(&self, message_id: &str, attachment_id: &str) -> anyhow::Result<Bytes> {
+        let _permit = self.semaphore.acquire().await?;
         debug!("Downloading attachment {} from message {}", attachment_id, message_id);
         let mut request = self.hub.users().messages_attachments_get("me", message_id, attachment_id);
         for scope in Self::scopes() {
@@ -349,6 +353,7 @@ impl GmailClient {
     }
 
     pub async fn search_messages(&self, query: &str) -> anyhow::Result<Vec<Message>> {
+        let _permit = self.semaphore.acquire().await?;
         let mut request = self.hub.users().messages_list("me")
             .q(query);
         for scope in Self::scopes() {
