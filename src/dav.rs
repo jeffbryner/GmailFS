@@ -11,6 +11,7 @@ use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use futures::stream::StreamExt;
 use std::fmt;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct GmailDav {
@@ -18,7 +19,6 @@ pub struct GmailDav {
     body_cache: Arc<BodyCache>,
     path_to_id: Arc<DashMap<String, String>>,
     active_searches: Arc<DashSet<String>>,
-    // Paths that have been "virtually deleted" by the OS
     tombstones: Arc<DashSet<String>>,
 }
 
@@ -116,15 +116,31 @@ impl GmailDav {
 }
 
 impl DavFileSystem for GmailDav {
-    fn open<'a>(&'a self, path: &'a DavPath, _options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
+    fn open<'a>(&'a self, path: &'a DavPath, options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
+            let rel_path = path.as_rel_ospath();
+            let rel_path_str = rel_path.to_str().unwrap_or("");
+            let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
+
+            if parts.len() == 2 && parts[0] == "outbox" && (options.write || options.create) {
+                return Ok(Box::new(GmailDavFile { 
+                    dav: self.clone(), 
+                    path: path.clone(), 
+                    content: None, 
+                    size: None,
+                    pos: 0,
+                    write_buffer: Some(Arc::new(Mutex::new(Vec::new()))),
+                }) as Box<dyn DavFile>);
+            }
+
             let content = self.get_content_bytes(path).await?;
             Ok(Box::new(GmailDavFile { 
                 dav: self.clone(), 
                 path: path.clone(), 
                 content: Some(content), 
                 size: None,
-                pos: 0 
+                pos: 0,
+                write_buffer: None,
             }) as Box<dyn DavFile>)
         }.boxed()
     }
@@ -146,6 +162,7 @@ impl DavFileSystem for GmailDav {
                 entries.push(Box::new(GmailDavDirEntry::new("00_MOUNT_CHECK_OK", false)));
                 entries.push(Box::new(GmailDavDirEntry::new("inbox", true)));
                 entries.push(Box::new(GmailDavDirEntry::new("unread", true)));
+                entries.push(Box::new(GmailDavDirEntry::new("outbox", true)));
                 entries.push(Box::new(GmailDavDirEntry::new("search", true)));
             } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 1 {
                 let message_stubs = if parts[0] == "inbox" {
@@ -168,6 +185,8 @@ impl DavFileSystem for GmailDav {
                         entries.push(Box::new(GmailDavDirEntry::new(&display_name, true)));
                     }
                 }
+            } else if parts[0] == "outbox" && parts.len() == 1 {
+                // Outbox is normally empty until someone writes to it
             } else if parts[0] == "search" && parts.len() == 1 {
                 entries.push(Box::new(GmailDavDirEntry::new("example-query", true)));
                 for query in self.active_searches.iter() {
@@ -210,7 +229,6 @@ impl DavFileSystem for GmailDav {
                 }
             }
 
-            // Filter out tombstones
             let filtered_entries: Vec<_> = entries.into_iter().filter(|e| {
                 let name = String::from_utf8_lossy(&e.name()).to_string();
                 let full_child_path = if rel_path_str.is_empty() {
@@ -249,7 +267,7 @@ impl DavFileSystem for GmailDav {
 
             if parts.is_empty() {
                 is_dir = true;
-            } else if parts.len() == 1 && (parts[0] == "inbox" || parts[0] == "unread" || parts[0] == "search") {
+            } else if parts.len() == 1 && (parts[0] == "inbox" || parts[0] == "unread" || parts[0] == "search" || parts[0] == "outbox") {
                 is_dir = true;
             } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 2 {
                 is_dir = true;
@@ -260,6 +278,8 @@ impl DavFileSystem for GmailDav {
             } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3 && parts[2] == "attachments") || (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments") {
                 is_dir = true;
             } else if parts.len() == 1 && parts[0] == "00_MOUNT_CHECK_OK" {
+                is_file = true;
+            } else if parts[0] == "outbox" && parts.len() == 2 {
                 is_file = true;
             } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3) || (parts.len() == 4 && parts[0] == "search") {
                 is_file = true;
@@ -272,6 +292,10 @@ impl DavFileSystem for GmailDav {
             } else if is_file {
                 if parts[0] == "00_MOUNT_CHECK_OK" {
                     return Ok(Box::new(GmailDavMetaData::new(false, 2)) as Box<dyn DavMetaData>);
+                }
+
+                if parts[0] == "outbox" {
+                    return Ok(Box::new(GmailDavMetaData::new(false, 0)) as Box<dyn DavMetaData>);
                 }
 
                 let (msg_display_name, file_name, is_attachment) = if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 4 && parts[2] == "attachments" {
@@ -289,8 +313,6 @@ impl DavFileSystem for GmailDav {
                     return Ok(Box::new(GmailDavMetaData::new(false, att.size)) as Box<dyn DavMetaData>);
                 }
 
-                // Optimization: return a dummy size for text files to avoid blocking metadata calls
-                // The actual size will be provided when the file is opened.
                 Ok(Box::new(GmailDavMetaData::new(false, 1024)) as Box<dyn DavMetaData>)
             } else {
                 Err(FsError::NotFound)
@@ -340,7 +362,6 @@ impl DavFileSystem for GmailDav {
                 })?;
                 
                 self.tombstones.insert(rel_path_str.to_string());
-                // Manual cleanup of child tombstones
                 let to_remove: Vec<String> = self.tombstones.iter()
                     .filter(|p| p.starts_with(&format!("{}/", rel_path_str)))
                     .map(|p| p.clone())
@@ -369,7 +390,8 @@ impl DavFileSystem for GmailDav {
             if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3) || 
                (parts.len() == 4 && parts[0] == "search") ||
                ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 4 && parts[2] == "attachments") ||
-               (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments") {
+               (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments") ||
+               (parts[0] == "outbox") {
                 self.tombstones.insert(rel_path_str.to_string());
                 Ok(())
             } else {
@@ -439,6 +461,7 @@ struct GmailDavFile {
     content: Option<Bytes>,
     size: Option<u64>,
     pos: usize,
+    write_buffer: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 impl DavFile for GmailDavFile {
@@ -448,6 +471,8 @@ impl DavFile for GmailDavFile {
                 Ok(Box::new(GmailDavMetaData::new(false, content.len() as u64)) as Box<dyn DavMetaData>)
             } else if let Some(size) = self.size {
                 Ok(Box::new(GmailDavMetaData::new(false, size)) as Box<dyn DavMetaData>)
+            } else if self.write_buffer.is_some() {
+                Ok(Box::new(GmailDavMetaData::new(false, 0)) as Box<dyn DavMetaData>)
             } else {
                 let content = self.dav.get_content_bytes(&self.path).await?;
                 let size = content.len() as u64;
@@ -456,12 +481,34 @@ impl DavFile for GmailDavFile {
         }.boxed()
     }
 
-    fn write_buf(&mut self, _buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
-        async move { Err(FsError::Forbidden) }.boxed()
+    fn write_buf(&mut self, buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
+        async move {
+            if let Some(buffer) = &self.write_buffer {
+                let mut buffer = buffer.lock().await;
+                let mut b = buf;
+                while b.has_remaining() {
+                    let chunk = b.chunk();
+                    buffer.extend_from_slice(chunk);
+                    let len = chunk.len();
+                    b.advance(len);
+                }
+                Ok(())
+            } else {
+                Err(FsError::Forbidden)
+            }
+        }.boxed()
     }
 
-    fn write_bytes(&mut self, _buf: Bytes) -> FsFuture<'_, ()> {
-        async move { Err(FsError::Forbidden) }.boxed()
+    fn write_bytes(&mut self, buf: Bytes) -> FsFuture<'_, ()> {
+        async move {
+            if let Some(buffer) = &self.write_buffer {
+                let mut buffer = buffer.lock().await;
+                buffer.extend_from_slice(&buf);
+                Ok(())
+            } else {
+                Err(FsError::Forbidden)
+            }
+        }.boxed()
     }
 
     fn read_bytes(&mut self, count: usize) -> FsFuture<'_, Bytes> {
@@ -481,25 +528,63 @@ impl DavFile for GmailDavFile {
 
     fn seek(&mut self, pos: SeekFrom) -> FsFuture<'_, u64> {
         async move {
-            if self.content.is_none() {
+            if self.content.is_none() && self.write_buffer.is_none() {
                 self.content = Some(self.dav.get_content_bytes(&self.path).await?);
             }
-            let content = self.content.as_ref().unwrap();
-            let new_pos = match pos {
-                SeekFrom::Start(p) => p as i64,
-                SeekFrom::Current(p) => self.pos as i64 + p,
-                SeekFrom::End(p) => content.len() as i64 + p,
-            };
-            if new_pos < 0 {
-                return Err(FsError::Forbidden);
+            if let Some(content) = &self.content {
+                let new_pos = match pos {
+                    SeekFrom::Start(p) => p as i64,
+                    SeekFrom::Current(p) => self.pos as i64 + p,
+                    SeekFrom::End(p) => content.len() as i64 + p,
+                };
+                if new_pos < 0 {
+                    return Err(FsError::Forbidden);
+                }
+                self.pos = std::cmp::min(new_pos as usize, content.len());
+                debug!("seek: new_pos={}", self.pos);
+                Ok(self.pos as u64)
+            } else {
+                Ok(0)
             }
-            self.pos = std::cmp::min(new_pos as usize, content.len());
-            debug!("seek: new_pos={}", self.pos);
-            Ok(self.pos as u64)
         }.boxed()
     }
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
-        async move { Ok(()) }.boxed()
+        async move {
+            if let Some(buffer) = &self.write_buffer {
+                let data = buffer.lock().await;
+                let content = String::from_utf8_lossy(&data).to_string();
+                
+                // Parse headers and body
+                let mut to = String::new();
+                let mut subject = String::new();
+                let mut body = String::new();
+                let mut parsing_headers = true;
+
+                for line in content.lines() {
+                    if parsing_headers {
+                        if line.is_empty() {
+                            parsing_headers = false;
+                            continue;
+                        }
+                        if line.to_lowercase().starts_with("to:") {
+                            to = line[3..].trim().to_string();
+                        } else if line.to_lowercase().starts_with("subject:") {
+                            subject = line[8..].trim().to_string();
+                        }
+                    } else {
+                        body.push_str(line);
+                        body.push('\n');
+                    }
+                }
+
+                if !to.is_empty() {
+                    info!("Flush triggered send to: {}", to);
+                    self.dav.client.send_email(&to, &subject, &body).await
+                        .map_err(|e| { error!("Send failed: {}", e); FsError::GeneralFailure })?;
+                }
+            }
+            Ok(())
+        }.boxed()
     }
 }
