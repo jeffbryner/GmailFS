@@ -1,19 +1,19 @@
-use google_gmail1::api::Message;
-use google_gmail1::Gmail;
-use google_gmail1::{yup_oauth2, common};
-use google_gmail1::hyper_util::client::legacy::Client;
-use google_gmail1::hyper_util::client::legacy::connect::HttpConnector;
-use tracing::debug;
-use serde_json::json;
-use chrono::DateTime;
 use bytes::Bytes;
-use moka::future::Cache;
-use std::time::Duration;
-use std::sync::Arc;
-use std::fmt;
+use chrono::DateTime;
+use google_gmail1::api::Message;
+use google_gmail1::hyper_util::client::legacy::connect::HttpConnector;
+use google_gmail1::hyper_util::client::legacy::Client;
+use google_gmail1::Gmail;
+use google_gmail1::{common, yup_oauth2};
 use mail_builder::MessageBuilder;
-use std::io::Cursor;
 use mime::Mime;
+use moka::future::Cache;
+use serde_json::json;
+use std::fmt;
+use std::io::Cursor;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct AttachmentMeta {
@@ -40,11 +40,11 @@ impl GmailClient {
             .https_only()
             .enable_http1()
             .build();
-        
+
         let executor = google_gmail1::hyper_util::rt::TokioExecutor::new();
-        
+
         let auth_client = Client::builder(executor.clone()).build(connector.clone());
-        let hub_client: common::Client<google_gmail1::hyper_rustls::HttpsConnector<HttpConnector>> = 
+        let hub_client: common::Client<google_gmail1::hyper_rustls::HttpsConnector<HttpConnector>> =
             Client::builder(executor).build(connector);
 
         let auth = yup_oauth2::InstalledFlowAuthenticator::with_client(
@@ -72,16 +72,23 @@ impl GmailClient {
         ]
     }
 
-    pub async fn list_messages_with_label(&self, label_id: &str, max: u32) -> anyhow::Result<Vec<Message>> {
+    pub async fn list_messages_with_label(
+        &self,
+        label_id: &str,
+        max: u32,
+    ) -> anyhow::Result<Vec<Message>> {
         debug!("Listing messages with label {} (max {})", label_id, max);
-        let mut request = self.hub.users().messages_list("me")
+        let mut request = self
+            .hub
+            .users()
+            .messages_list("me")
             .add_label_ids(label_id)
             .max_results(max);
-        
+
         for scope in Self::scopes() {
             request = request.add_scope(scope);
         }
-        
+
         let (_, list) = request.doit().await?;
         Ok(list.messages.unwrap_or_default())
     }
@@ -100,13 +107,12 @@ impl GmailClient {
         }
 
         debug!("Fetching message {} from Gmail API", id);
-        let mut request = self.hub.users().messages_get("me", id)
-            .format("full");
-        
+        let mut request = self.hub.users().messages_get("me", id).format("full");
+
         for scope in Self::scopes() {
             request = request.add_scope(scope);
         }
-        
+
         let (_, msg) = request.doit().await?;
         let msg = Arc::new(msg);
         self.message_cache.insert(id.to_string(), msg.clone()).await;
@@ -142,23 +148,21 @@ impl GmailClient {
 
     pub async fn send_email(&self, to: &str, subject: &str, body: &str) -> anyhow::Result<()> {
         debug!("Sending email to: {}, subject: {}", to, subject);
-        
+
         let mut builder = MessageBuilder::new();
-        builder = builder.to(to)
-            .subject(subject)
-            .text_body(body);
-        
+        builder = builder.to(to).subject(subject).text_body(body);
+
         let raw_mime = builder.write_to_vec()?;
-        
+
         // Use the upload flow for sending raw MIME messages
         let mut request = self.hub.users().messages_send(Message::default(), "me");
         for scope in Self::scopes() {
             request = request.add_scope(scope);
         }
-        
+
         let mime_type: Mime = "message/rfc822".parse().unwrap();
         request.upload(Cursor::new(raw_mime), mime_type).await?;
-        
+
         Ok(())
     }
 
@@ -171,7 +175,11 @@ impl GmailClient {
         Ok(list)
     }
 
-    fn find_attachments(&self, part: &google_gmail1::api::MessagePart, list: &mut Vec<AttachmentMeta>) {
+    fn find_attachments(
+        &self,
+        part: &google_gmail1::api::MessagePart,
+        list: &mut Vec<AttachmentMeta>,
+    ) {
         if let (Some(filename), Some(body)) = (&part.filename, &part.body) {
             if let Some(attachment_id) = &body.attachment_id {
                 if !filename.is_empty() {
@@ -190,14 +198,24 @@ impl GmailClient {
         }
     }
 
-    pub async fn get_attachment_data(&self, message_id: &str, attachment_id: &str) -> anyhow::Result<Bytes> {
-        debug!("Downloading attachment {} from message {}", attachment_id, message_id);
-        let mut request = self.hub.users().messages_attachments_get("me", message_id, attachment_id);
+    pub async fn get_attachment_data(
+        &self,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> anyhow::Result<Bytes> {
+        debug!(
+            "Downloading attachment {} from message {}",
+            attachment_id, message_id
+        );
+        let mut request =
+            self.hub
+                .users()
+                .messages_attachments_get("me", message_id, attachment_id);
         for scope in Self::scopes() {
             request = request.add_scope(scope);
         }
         let (_, body) = request.doit().await?;
-        
+
         if let Some(data) = body.data {
             Ok(Bytes::copy_from_slice(&data))
         } else {
@@ -208,12 +226,31 @@ impl GmailClient {
     pub async fn get_message_markdown_bytes(&self, id: &str) -> anyhow::Result<Bytes> {
         let msg = self.get_message(id).await?;
         let body = self.extract_body(&msg);
-        
+        let snippet = msg.snippet.clone().unwrap_or_default();
+
         let mut result = if body.is_empty() {
-            msg.snippet.clone().unwrap_or_default()
+            snippet
         } else {
-            let cleaned = ammonia::clean(&body);
-            html2md::parse_html(&cleaned)
+            let body_clone = body.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let cleaned = ammonia::clean(&body_clone);
+                html2md::parse_html(&cleaned)
+            });
+
+            match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
+                Ok(Ok(md)) => md,
+                Ok(Err(e)) => {
+                    warn!("Error parsing markdown for message {}: {}", id, e);
+                    snippet
+                }
+                Err(_) => {
+                    warn!(
+                        "Timeout parsing markdown for message {}, falling back to snippet",
+                        id
+                    );
+                    snippet
+                }
+            }
         };
 
         if !result.ends_with('\n') {
@@ -273,10 +310,11 @@ impl GmailClient {
                         }
                         Some("Subject") => {
                             if let Some(val) = &h.value {
-                                let raw_subject = val.chars()
+                                let raw_subject = val
+                                    .chars()
                                     .map(|c| if c.is_alphanumeric() { c } else { '_' })
                                     .collect::<String>();
-                                
+
                                 let mut collapsed = String::new();
                                 let mut last_was_underscore = false;
                                 for c in raw_subject.chars() {
@@ -300,7 +338,12 @@ impl GmailClient {
         }
 
         subject.truncate(50);
-        format!("{}_{}_{}", date_str, subject, msg.id.as_deref().unwrap_or("unknown"))
+        format!(
+            "{}_{}_{}",
+            date_str,
+            subject,
+            msg.id.as_deref().unwrap_or("unknown")
+        )
     }
 
     fn extract_body(&self, msg: &Message) -> String {
@@ -327,20 +370,26 @@ impl GmailClient {
             for p in parts {
                 if p.mime_type.as_deref() == Some("text/html") {
                     let res = self.extract_part(p);
-                    if !res.is_empty() { return res; }
+                    if !res.is_empty() {
+                        return res;
+                    }
                 }
             }
             for p in parts {
                 if p.mime_type.as_deref() == Some("text/plain") {
                     let res = self.extract_part(p);
-                    if !res.is_empty() { return res; }
+                    if !res.is_empty() {
+                        return res;
+                    }
                 }
             }
             for p in parts {
                 let sub_mime = p.mime_type.as_deref().unwrap_or("");
                 if sub_mime.starts_with("multipart/") {
                     let res = self.extract_part(p);
-                    if !res.is_empty() { return res; }
+                    if !res.is_empty() {
+                        return res;
+                    }
                 }
             }
         }
@@ -349,13 +398,12 @@ impl GmailClient {
     }
 
     pub async fn search_messages(&self, query: &str) -> anyhow::Result<Vec<Message>> {
-        let mut request = self.hub.users().messages_list("me")
-            .q(query);
+        let mut request = self.hub.users().messages_list("me").q(query);
         for scope in Self::scopes() {
             request = request.add_scope(scope);
         }
         let (_, list) = request.doit().await?;
-        
+
         Ok(list.messages.unwrap_or_default())
     }
 }
