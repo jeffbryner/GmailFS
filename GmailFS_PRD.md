@@ -22,12 +22,12 @@ The agent interacts with the following hierarchy:
 │       └── attachments/    # Nested directory for attachments
 ├── search/
 │   └── [LiveQuery]/        # Results of mkdir [Query] as symlink-like folders
-└── all_mail/               # (Future) Full archive access
+└── unread/                 # Same as inbox but only unread messages
 ```
 
 ---
 
-## 3. Key Functional Requirements
+## 3. Key Features
 
 ### 3.1 Magic Search Implementation
 * **Virtual Query Nodes:** When the agent creates a directory (e.g., `mkdir search/"from:internal.com"`), the daemon registers that query string.
@@ -57,7 +57,7 @@ The agent interacts with the following hierarchy:
 ### 4.3 Permissions
 * `GET` and `PROPFIND` map to `read` permissions.
 * `MKCOL` (mkdir) inside `/search` registers new queries.
-* `DELETE` (Future) will map to `messages.trash`.
+* `DELETE` maps to `messages.trash`.
 
 ---
 
@@ -72,10 +72,33 @@ The agent interacts with the following hierarchy:
 * Implement Descriptive Naming (`YYYY-MM-DD_Subject`).
 * Implement Magic Search via `mkdir`.
 
-### Milestone 3: Advanced Operations (Current)
+### Milestone 3: Advanced Operations (Completed)
 * Support for live attachment downloads.
-* Support for trashing/moving emails via `rm`.
-* Background cache invalidation via Pub/Sub.
+* Support for trashing/moving emails via `rm -rf <directory representing the individual email>`.
+
+### Milestone 4: Agent friendly email sending
+Optimized for speed. An agent just writes a single .md file to a special directory, and the daemon sends it on close.
+This minimizes the number of filesystem operations an agent needs to perform, making it the most "agent-friendly."
+To an agent, sending email looks like a single, atomic operation—the simplest possible way to interact with an external system. 
+
+  Here is exactly how an agent (like gemini-cli or a Python script) would send an email using GmailFS:
+
+  1. The Command
+  The agent simply uses a single cat command (or its equivalent write_file tool):
+```
+    1 cat <<EOF > /tmp/gmail/outbox/status_report.md
+    2 To: team@example.com
+    3 Subject: Weekly Progress Update
+    4
+    5 ## Accomplishments
+    6 - Implemented WebDAV backend.
+    7 - Optimized attachment downloads.
+    8 - Added unread folder support.
+    9
+   10 This update was sent automatically by the GmailFS agent.
+   11 EOF
+```
+
 
 ---
 

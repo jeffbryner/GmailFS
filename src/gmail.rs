@@ -11,6 +11,9 @@ use moka::future::Cache;
 use std::time::Duration;
 use std::sync::Arc;
 use std::fmt;
+use mail_builder::MessageBuilder;
+use std::io::Cursor;
+use mime::Mime;
 
 #[derive(Debug, Clone)]
 pub struct AttachmentMeta {
@@ -62,18 +65,24 @@ impl GmailClient {
         Ok(Self { hub, message_cache })
     }
 
-    fn scope() -> &'static str {
-        google_gmail1::api::Scope::Modify.as_ref()
+    fn scopes() -> Vec<&'static str> {
+        vec![
+            google_gmail1::api::Scope::Modify.as_ref(),
+            google_gmail1::api::Scope::Send.as_ref(),
+        ]
     }
 
     pub async fn list_messages_with_label(&self, label_id: &str, max: u32) -> anyhow::Result<Vec<Message>> {
         debug!("Listing messages with label {} (max {})", label_id, max);
-        let (_, list) = self.hub.users().messages_list("me")
+        let mut request = self.hub.users().messages_list("me")
             .add_label_ids(label_id)
-            .max_results(max)
-            .add_scope(Self::scope())
-            .doit().await?;
+            .max_results(max);
         
+        for scope in Self::scopes() {
+            request = request.add_scope(scope);
+        }
+        
+        let (_, list) = request.doit().await?;
         Ok(list.messages.unwrap_or_default())
     }
 
@@ -91,11 +100,14 @@ impl GmailClient {
         }
 
         debug!("Fetching message {} from Gmail API", id);
-        let (_, msg) = self.hub.users().messages_get("me", id)
-            .format("full")
-            .add_scope(Self::scope())
-            .doit().await?;
+        let mut request = self.hub.users().messages_get("me", id)
+            .format("full");
         
+        for scope in Self::scopes() {
+            request = request.add_scope(scope);
+        }
+        
+        let (_, msg) = request.doit().await?;
         let msg = Arc::new(msg);
         self.message_cache.insert(id.to_string(), msg.clone()).await;
         Ok(msg)
@@ -103,9 +115,11 @@ impl GmailClient {
 
     pub async fn trash_message(&self, id: &str) -> anyhow::Result<()> {
         debug!("Trashing message {}", id);
-        self.hub.users().messages_trash("me", id)
-            .add_scope(Self::scope())
-            .doit().await?;
+        let mut request = self.hub.users().messages_trash("me", id);
+        for scope in Self::scopes() {
+            request = request.add_scope(scope);
+        }
+        request.doit().await?;
         self.message_cache.invalidate(id).await;
         Ok(())
     }
@@ -117,10 +131,34 @@ impl GmailClient {
             ids: Some(vec![id.to_string()]),
             remove_label_ids: Some(vec!["INBOX".to_string()]),
         };
-        self.hub.users().messages_batch_modify(req, "me")
-            .add_scope(Self::scope())
-            .doit().await?;
+        let mut request = self.hub.users().messages_batch_modify(req, "me");
+        for scope in Self::scopes() {
+            request = request.add_scope(scope);
+        }
+        request.doit().await?;
         self.message_cache.invalidate(id).await;
+        Ok(())
+    }
+
+    pub async fn send_email(&self, to: &str, subject: &str, body: &str) -> anyhow::Result<()> {
+        debug!("Sending email to: {}, subject: {}", to, subject);
+        
+        let mut builder = MessageBuilder::new();
+        builder = builder.to(to)
+            .subject(subject)
+            .text_body(body);
+        
+        let raw_mime = builder.write_to_vec()?;
+        
+        // Use the upload flow for sending raw MIME messages
+        let mut request = self.hub.users().messages_send(Message::default(), "me");
+        for scope in Self::scopes() {
+            request = request.add_scope(scope);
+        }
+        
+        let mime_type: Mime = "message/rfc822".parse().unwrap();
+        request.upload(Cursor::new(raw_mime), mime_type).await?;
+        
         Ok(())
     }
 
@@ -154,9 +192,11 @@ impl GmailClient {
 
     pub async fn get_attachment_data(&self, message_id: &str, attachment_id: &str) -> anyhow::Result<Bytes> {
         debug!("Downloading attachment {} from message {}", attachment_id, message_id);
-        let (_, body) = self.hub.users().messages_attachments_get("me", message_id, attachment_id)
-            .add_scope(Self::scope())
-            .doit().await?;
+        let mut request = self.hub.users().messages_attachments_get("me", message_id, attachment_id);
+        for scope in Self::scopes() {
+            request = request.add_scope(scope);
+        }
+        let (_, body) = request.doit().await?;
         
         if let Some(data) = body.data {
             Ok(Bytes::copy_from_slice(&data))
@@ -309,10 +349,12 @@ impl GmailClient {
     }
 
     pub async fn search_messages(&self, query: &str) -> anyhow::Result<Vec<Message>> {
-        let (_, list) = self.hub.users().messages_list("me")
-            .q(query)
-            .add_scope(Self::scope())
-            .doit().await?;
+        let mut request = self.hub.users().messages_list("me")
+            .q(query);
+        for scope in Self::scopes() {
+            request = request.add_scope(scope);
+        }
+        let (_, list) = request.doit().await?;
         
         Ok(list.messages.unwrap_or_default())
     }
