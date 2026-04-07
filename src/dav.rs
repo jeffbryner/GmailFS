@@ -1,7 +1,7 @@
 use crate::cache::BodyCache;
 use crate::gmail::GmailClient;
 use bytes::Bytes;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashSet;
 use dav_server::davpath::DavPath;
 use dav_server::fs::*;
 use futures::future::FutureExt;
@@ -19,7 +19,7 @@ use tracing::{debug, error, info};
 pub struct GmailDav {
     client: Arc<GmailClient>,
     body_cache: Arc<BodyCache>,
-    path_to_id: Arc<DashMap<String, String>>,
+    path_to_id: Arc<moka::sync::Cache<String, String>>,
     active_searches: Arc<DashSet<String>>,
     tombstones: Arc<DashSet<String>>,
     api_semaphore: Arc<Semaphore>,
@@ -39,7 +39,12 @@ impl GmailDav {
         Self {
             client,
             body_cache,
-            path_to_id: Arc::new(DashMap::new()),
+            path_to_id: Arc::new(
+                moka::sync::Cache::builder()
+                    .time_to_live(Duration::from_secs(86400))
+                    .max_capacity(10000)
+                    .build(),
+            ),
             active_searches: Arc::new(DashSet::new()),
             tombstones: Arc::new(DashSet::new()),
             api_semaphore: Arc::new(Semaphore::new(10)),
@@ -53,7 +58,7 @@ impl GmailDav {
 
     fn resolve_id(&self, display_name: &str) -> Option<String> {
         if let Some(id) = self.path_to_id.get(display_name) {
-            return Some(id.clone());
+            return Some(id);
         }
         let parts: Vec<&str> = display_name.split('_').collect();
         if parts.len() >= 3 {
@@ -544,7 +549,7 @@ impl DavFileSystem for GmailDav {
 
             if parts.len() == 2 && parts[0] == "search" {
                 self.active_searches.remove(parts[1]);
-                self.tombstones.insert(rel_path_str.to_string());
+                // No tombstone needed; removal from active_searches + cache invalidation is enough
                 self.dir_cache.invalidate("search").await;
                 Ok(())
             } else if (parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread"))
@@ -561,7 +566,7 @@ impl DavFileSystem for GmailDav {
                     FsError::GeneralFailure
                 })?;
 
-                self.tombstones.insert(rel_path_str.to_string());
+                // No tombstone needed for the folder itself as it's gone from the API
                 let to_remove: Vec<String> = self
                     .tombstones
                     .iter()
@@ -586,6 +591,7 @@ impl DavFileSystem for GmailDav {
                 && parts[2] == "attachments")
                 || (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments")
             {
+                // Deleting the "attachments" folder itself
                 self.tombstones.insert(rel_path_str.to_string());
                 Ok(())
             } else {
