@@ -257,9 +257,9 @@ impl DavFileSystem for GmailDav {
                 let message_stubs = {
                     let _permit = self.api_semaphore.acquire().await;
                     if parts[0] == "inbox" {
-                        self.client.list_inbox_messages(20).await
+                        self.client.list_inbox_messages(100).await
                     } else {
-                        self.client.list_unread_messages(20).await
+                        self.client.list_unread_messages(100).await
                     }
                 }
                 .map_err(|_| FsError::GeneralFailure)?;
