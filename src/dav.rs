@@ -525,6 +525,7 @@ impl DavFileSystem for GmailDav {
                 if !self.active_searches.contains(&query) {
                     info!("Registered magic search node: {}", query);
                     self.active_searches.insert(query);
+                    self.dir_cache.invalidate("search").await;
                 }
                 Ok(())
             } else {
@@ -544,6 +545,7 @@ impl DavFileSystem for GmailDav {
             if parts.len() == 2 && parts[0] == "search" {
                 self.active_searches.remove(parts[1]);
                 self.tombstones.insert(rel_path_str.to_string());
+                self.dir_cache.invalidate("search").await;
                 Ok(())
             } else if (parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread"))
                 || (parts.len() == 3 && parts[0] == "search")
@@ -568,6 +570,15 @@ impl DavFileSystem for GmailDav {
                     .collect();
                 for p in to_remove {
                     self.tombstones.remove(&p);
+                }
+
+                // Invalidate parent directory cache
+                if parts[0] == "search" {
+                    self.dir_cache
+                        .invalidate(&format!("search/{}", parts[1]))
+                        .await;
+                } else {
+                    self.dir_cache.invalidate(parts[0]).await;
                 }
                 Ok(())
             } else if ((parts[0] == "inbox" || parts[0] == "unread")
@@ -594,6 +605,7 @@ impl DavFileSystem for GmailDav {
             if parts.len() == 2 && parts[0] == "search" && parts[1].ends_with(".query") {
                 let query = parts[1].trim_end_matches(".query");
                 self.active_searches.remove(query);
+                self.dir_cache.invalidate("search").await;
                 return Ok(());
             }
 
@@ -606,6 +618,12 @@ impl DavFileSystem for GmailDav {
                 || (parts[0] == "outbox")
             {
                 self.tombstones.insert(rel_path_str.to_string());
+                self.dir_cache.invalidate(parts[0]).await;
+                if parts[0] == "search" && parts.len() >= 2 {
+                    self.dir_cache
+                        .invalidate(&format!("{}/{}", parts[0], parts[1]))
+                        .await;
+                }
                 Ok(())
             } else {
                 Err(FsError::Forbidden)
