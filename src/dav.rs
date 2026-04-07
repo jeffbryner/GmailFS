@@ -258,6 +258,7 @@ impl DavFileSystem for GmailDav {
                 raw_entries.push(("unread".to_string(), true));
                 raw_entries.push(("outbox".to_string(), true));
                 raw_entries.push(("search".to_string(), true));
+                raw_entries.push(("saved_searches".to_string(), true));
             } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 1 {
                 let message_stubs = {
                     let _permit = self.api_semaphore.acquire().await;
@@ -292,12 +293,12 @@ impl DavFileSystem for GmailDav {
                 }
             } else if parts[0] == "outbox" && parts.len() == 1 {
                 // Outbox is normally empty until someone writes to it
-            } else if parts[0] == "search" && parts.len() == 1 {
-                raw_entries.push(("example-query".to_string(), true));
+            } else if (parts[0] == "search" || parts[0] == "saved_searches") && parts.len() == 1 {
+                if parts[0] == "search" {
+                    raw_entries.push(("example-query".to_string(), true));
+                }
                 for query in self.active_searches.iter() {
-                    let q = query.key().clone();
-                    raw_entries.push((q.clone(), true));
-                    raw_entries.push((format!("{}.query", q), false));
+                    raw_entries.push((query.key().clone(), true));
                 }
             } else if parts[0] == "search" && parts.len() == 2 {
                 let query = parts[1];
@@ -415,18 +416,14 @@ impl DavFileSystem for GmailDav {
                 && (parts[0] == "inbox"
                     || parts[0] == "unread"
                     || parts[0] == "search"
+                    || parts[0] == "saved_searches"
                     || parts[0] == "outbox")
             {
                 is_dir = true;
             } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 2 {
                 is_dir = true;
-            } else if parts[0] == "search" && parts.len() == 2 {
-                if parts[1].ends_with(".query") {
-                    let query = parts[1].trim_end_matches(".query");
-                    is_file = self.active_searches.contains(query);
-                } else {
-                    is_dir = parts[1] == "example-query" || self.active_searches.contains(parts[1]);
-                }
+            } else if (parts[0] == "search" || parts[0] == "saved_searches") && parts.len() == 2 {
+                is_dir = parts[1] == "example-query" || self.active_searches.contains(parts[1]);
             } else if parts[0] == "search" && parts.len() == 3 {
                 is_dir = true;
             } else if ((parts[0] == "inbox" || parts[0] == "unread")
@@ -459,10 +456,6 @@ impl DavFileSystem for GmailDav {
                 }
 
                 if parts[0] == "outbox" {
-                    return Ok(Box::new(GmailDavMetaData::new(false, 0)) as Box<dyn DavMetaData>);
-                }
-
-                if parts.len() == 2 && parts[0] == "search" && parts[1].ends_with(".query") {
                     return Ok(Box::new(GmailDavMetaData::new(false, 0)) as Box<dyn DavMetaData>);
                 }
 
@@ -525,12 +518,13 @@ impl DavFileSystem for GmailDav {
             info!("create_dir: path={:?} parts={:?}", rel_path, parts);
             self.tombstones.remove(rel_path_str);
 
-            if parts.len() == 2 && parts[0] == "search" {
+            if parts.len() == 2 && (parts[0] == "search" || parts[0] == "saved_searches") {
                 let query = parts[1].to_string();
                 if !self.active_searches.contains(&query) {
                     info!("Registered magic search node: {}", query);
                     self.active_searches.insert(query);
                     self.dir_cache.invalidate("search").await;
+                    self.dir_cache.invalidate("saved_searches").await;
                 }
                 Ok(())
             } else {
@@ -547,10 +541,11 @@ impl DavFileSystem for GmailDav {
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             info!("remove_dir: path={:?} parts={:?}", rel_path, parts);
 
-            if parts.len() == 2 && parts[0] == "search" {
+            if parts.len() == 2 && (parts[0] == "search" || parts[0] == "saved_searches") {
                 self.active_searches.remove(parts[1]);
                 // No tombstone needed; removal from active_searches + cache invalidation is enough
                 self.dir_cache.invalidate("search").await;
+                self.dir_cache.invalidate("saved_searches").await;
                 Ok(())
             } else if (parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread"))
                 || (parts.len() == 3 && parts[0] == "search")
@@ -607,13 +602,6 @@ impl DavFileSystem for GmailDav {
             let rel_path_str = rel_path.to_str().unwrap_or("");
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             info!("remove_file: path={:?} parts={:?}", rel_path, parts);
-
-            if parts.len() == 2 && parts[0] == "search" && parts[1].ends_with(".query") {
-                let query = parts[1].trim_end_matches(".query");
-                self.active_searches.remove(query);
-                self.dir_cache.invalidate("search").await;
-                return Ok(());
-            }
 
             if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3)
                 || (parts.len() == 4 && parts[0] == "search")

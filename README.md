@@ -68,9 +68,23 @@ cat inbox/[email_dir]/body.md
 ### Searching Gmail
 To find all emails from "Anthropic":
 ```bash
-mkdir search/"from:Anthropic"
+mkdir saved_searches/"from:Anthropic"
 ls -F search/"from:Anthropic"
 ```
+
+To present as a file system and handle deletion of search OR the email in the search, search management has two distinct folders:
+
+#### Management Plane (/saved_searches/):
+- Create a search: Run mkdir /tmp/gmail/saved_searches/"from:google"
+- Drop a search: Run rmdir /tmp/gmail/saved_searches/"from:google". 
+
+Because this directory is always empty, rmdir succeeds locally and macOS immediately updates its cache to know the search is gone. You can then recreate it instantly without "File exists" errors.
+
+#### Data Plane (/search/):
+- View results: Browse /tmp/gmail/search/"from:google"/ to see your emails.
+- Trash emails: You can still run rm -rf /tmp/gmail/search/"from:google" if you want to explicitly trash the emails found by that search.
+
+
 
 ### Sending an Email
 Simply `cat` a file into the `/outbox` directory. The first few lines should contain headers, followed by an empty line and the body.
