@@ -27,3 +27,4 @@ dav-server = { version = "0.7", features = ["hyper"] }
 headers = "0.4"
 bytes = "1.0"
 http-body-util = "0.1"
+directories = "6.0.0"
