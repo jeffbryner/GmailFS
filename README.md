@@ -116,7 +116,8 @@ cp inbox/[email_dir]/attachments/report.pdf ~/Desktop/
 ├── inbox/                  # Your Inbox
 ├── unread/                 # Unread messages only
 ├── outbox/                 # Write files here to send emails
-├── search/                 # Register queries via mkdir
+├── saved_searches/         # Register queries via mkdir to saved_searches
+├── search/                 # Resulting search emails
 │   └── [Query]/
 │       └── [EmailDir]/
 │           ├── body.md
@@ -126,12 +127,8 @@ cp inbox/[email_dir]/attachments/report.pdf ~/Desktop/
 └── 00_MOUNT_CHECK_OK       # Verification file
 ```
 
-## Claude tip: 
-Claude's tools tend to keep files open and not close them which can exhaust open file handles. Prompt it with something like: 
-
-```
-❯  hey, this directory is a mounted filesystem representation of my gmail. Please use only bash commands (not your file tools) when using it to limit open files.
-```
+## Agents
+Agents can make use of the `gmail-fs-skill` directory to get an understanding of how to use this for handling gmail inboxes.
 
 ## License
 Mozilla Public License Version 2.0
