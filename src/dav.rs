@@ -1,25 +1,29 @@
-use std::sync::Arc;
-use std::time::SystemTime;
-use std::io::SeekFrom;
-use dav_server::fs::*;
-use dav_server::davpath::DavPath;
-use futures::future::FutureExt;
-use crate::gmail::GmailClient;
 use crate::cache::BodyCache;
-use tracing::{error, info, debug};
+use crate::gmail::GmailClient;
 use bytes::Bytes;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashSet;
+use dav_server::davpath::DavPath;
+use dav_server::fs::*;
+use futures::future::FutureExt;
 use futures::stream::StreamExt;
+use moka::future::Cache;
 use std::fmt;
-use tokio::sync::Mutex;
+use std::io::SeekFrom;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::SystemTime;
+use tokio::sync::{Mutex, Semaphore};
+use tracing::{debug, error, info};
 
 #[derive(Clone)]
 pub struct GmailDav {
     client: Arc<GmailClient>,
     body_cache: Arc<BodyCache>,
-    path_to_id: Arc<DashMap<String, String>>,
+    path_to_id: Arc<moka::sync::Cache<String, String>>,
     active_searches: Arc<DashSet<String>>,
     tombstones: Arc<DashSet<String>>,
+    api_semaphore: Arc<Semaphore>,
+    dir_cache: Arc<Cache<String, Vec<(String, bool)>>>,
 }
 
 impl fmt::Debug for GmailDav {
@@ -32,18 +36,29 @@ impl fmt::Debug for GmailDav {
 
 impl GmailDav {
     pub fn new(client: Arc<GmailClient>, body_cache: Arc<BodyCache>) -> Self {
-        Self { 
-            client, 
+        Self {
+            client,
             body_cache,
-            path_to_id: Arc::new(DashMap::new()),
+            path_to_id: Arc::new(
+                moka::sync::Cache::builder()
+                    .time_to_live(Duration::from_secs(86400))
+                    .max_capacity(10000)
+                    .build(),
+            ),
             active_searches: Arc::new(DashSet::new()),
             tombstones: Arc::new(DashSet::new()),
+            api_semaphore: Arc::new(Semaphore::new(10)),
+            dir_cache: Arc::new(
+                Cache::builder()
+                    .time_to_live(Duration::from_secs(30))
+                    .build(),
+            ),
         }
     }
 
     fn resolve_id(&self, display_name: &str) -> Option<String> {
         if let Some(id) = self.path_to_id.get(display_name) {
-            return Some(id.clone());
+            return Some(id);
         }
         let parts: Vec<&str> = display_name.split('_').collect();
         if parts.len() >= 3 {
@@ -63,21 +78,25 @@ impl GmailDav {
         }
 
         let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
-        
-        let (msg_display_name, file_name, is_attachment) = if parts.len() == 3 && (parts[0] == "inbox" || parts[0] == "unread") {
-            (parts[1], parts[2], false)
-        } else if parts.len() == 4 && parts[0] == "search" {
-            (parts[2], parts[3], false)
-        } else if parts.len() == 4 && (parts[0] == "inbox" || parts[0] == "unread") && parts[2] == "attachments" {
-            (parts[1], parts[3], true)
-        } else if parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments" {
-            (parts[2], parts[4], true)
-        } else {
-            return Err(FsError::NotFound);
-        };
+
+        let (msg_display_name, file_name, is_attachment) =
+            if parts.len() == 3 && (parts[0] == "inbox" || parts[0] == "unread") {
+                (parts[1], parts[2], false)
+            } else if parts.len() == 4 && parts[0] == "search" {
+                (parts[2], parts[3], false)
+            } else if parts.len() == 4
+                && (parts[0] == "inbox" || parts[0] == "unread")
+                && parts[2] == "attachments"
+            {
+                (parts[1], parts[3], true)
+            } else if parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments" {
+                (parts[2], parts[4], true)
+            } else {
+                return Err(FsError::NotFound);
+            };
 
         let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
-        
+
         let cache_key = if is_attachment {
             format!("{}:att:{}", msg_id, file_name)
         } else {
@@ -87,62 +106,114 @@ impl GmailDav {
         let client = self.client.clone();
         let msg_id_clone = msg_id.clone();
         let file_name_clone = file_name.to_string();
+        let semaphore = self.api_semaphore.clone();
 
-        self.body_cache.get_or_insert_with(cache_key.clone(), move || async move {
-            if is_attachment {
-                info!("Starting live download for attachment: {} from message {}", file_name_clone, msg_id_clone);
-                let atts = client.get_attachments_list(&msg_id_clone).await
-                    .map_err(|e| { error!("Failed to list attachments: {}", e); FsError::GeneralFailure })?;
-                let att = atts.into_iter().find(|a| a.name == file_name_clone).ok_or(FsError::NotFound)?;
-                let data = client.get_attachment_data(&msg_id_clone, &att.attachment_id).await
-                    .map_err(|e| { error!("Attachment download failed: {}", e); FsError::GeneralFailure })?;
-                info!("Download complete: {} bytes", data.len());
-                Ok(data)
-            } else {
-                match file_name_clone.as_str() {
-                    "body.md" => client.get_message_markdown_bytes(&msg_id_clone).await
-                        .map_err(|e| { error!("MD fetch failed: {}", e); FsError::GeneralFailure }),
-                    "body.html" => client.get_message_html_bytes(&msg_id_clone).await
-                        .map_err(|_| FsError::GeneralFailure),
-                    "snippet.txt" => client.get_message_snippet_bytes(&msg_id_clone).await
-                        .map_err(|_| FsError::GeneralFailure),
-                    "metadata.json" => client.get_message_metadata_bytes(&msg_id_clone).await
-                        .map_err(|_| FsError::GeneralFailure),
-                    _ => Err(FsError::NotFound),
+        self.body_cache
+            .get_or_insert_with(cache_key.clone(), move || async move {
+                let _permit = semaphore.acquire().await.map_err(|_| {
+                    error!("Failed to acquire API semaphore");
+                    FsError::GeneralFailure
+                })?;
+                if is_attachment {
+                    info!(
+                        "Starting live download for attachment: {} from message {}",
+                        file_name_clone, msg_id_clone
+                    );
+                    let atts = client
+                        .get_attachments_list(&msg_id_clone)
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to list attachments: {}", e);
+                            FsError::GeneralFailure
+                        })?;
+                    let att = atts
+                        .into_iter()
+                        .find(|a| a.name == file_name_clone)
+                        .ok_or(FsError::NotFound)?;
+                    let data = client
+                        .get_attachment_data(&msg_id_clone, &att.attachment_id)
+                        .await
+                        .map_err(|e| {
+                            error!("Attachment download failed: {}", e);
+                            FsError::GeneralFailure
+                        })?;
+                    info!("Download complete: {} bytes", data.len());
+                    Ok(data)
+                } else {
+                    match file_name_clone.as_str() {
+                        "body.md" => client
+                            .get_message_markdown_bytes(&msg_id_clone)
+                            .await
+                            .map_err(|e| {
+                                error!("MD fetch failed: {}", e);
+                                FsError::GeneralFailure
+                            }),
+                        "body.html" => client
+                            .get_message_html_bytes(&msg_id_clone)
+                            .await
+                            .map_err(|_| FsError::GeneralFailure),
+                        "snippet.txt" => client
+                            .get_message_snippet_bytes(&msg_id_clone)
+                            .await
+                            .map_err(|_| FsError::GeneralFailure),
+                        "metadata.json" => client
+                            .get_message_metadata_bytes(&msg_id_clone)
+                            .await
+                            .map_err(|_| FsError::GeneralFailure),
+                        _ => Err(FsError::NotFound),
+                    }
                 }
-            }
-        }).await
+            })
+            .await
     }
 }
 
 impl DavFileSystem for GmailDav {
-    fn open<'a>(&'a self, path: &'a DavPath, options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
+    fn open<'a>(
+        &'a self,
+        path: &'a DavPath,
+        options: OpenOptions,
+    ) -> FsFuture<'a, Box<dyn DavFile>> {
         async move {
             let rel_path = path.as_rel_ospath();
             let rel_path_str = rel_path.to_str().unwrap_or("");
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
 
             if parts.len() == 2 && parts[0] == "outbox" && (options.write || options.create) {
-                return Ok(Box::new(GmailDavFile { 
-                    dav: self.clone(), 
-                    path: path.clone(), 
-                    content: None, 
+                return Ok(Box::new(GmailDavFile {
+                    dav: self.clone(),
+                    path: path.clone(),
+                    content: None,
                     size: None,
                     pos: 0,
                     write_buffer: Some(Arc::new(Mutex::new(Vec::new()))),
                 }) as Box<dyn DavFile>);
             }
 
-            let content = self.get_content_bytes(path).await?;
-            Ok(Box::new(GmailDavFile { 
-                dav: self.clone(), 
-                path: path.clone(), 
-                content: Some(content), 
-                size: None,
+            // Lazy loading: verify existence and get metadata first,
+            // but return a file handle without pre-fetching content bytes.
+            // Full download happens on-demand in read_bytes/seek/metadata.
+            let meta = self.metadata(path).await?;
+
+            // If the metadata returned a dummy size (1024), we set size to None
+            // so that DavFile::metadata will trigger a real download to get the true size
+            // for the Content-Length header during GET requests.
+            let size = if meta.len() == 1024 {
+                None
+            } else {
+                Some(meta.len())
+            };
+
+            Ok(Box::new(GmailDavFile {
+                dav: self.clone(),
+                path: path.clone(),
+                content: None,
+                size,
                 pos: 0,
                 write_buffer: None,
             }) as Box<dyn DavFile>)
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn read_dir<'a>(
@@ -156,99 +227,173 @@ impl DavFileSystem for GmailDav {
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             info!("read_dir: path={:?} parts={:?}", rel_path, parts);
 
-            let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
+            if let Some(cached_entries) = self.dir_cache.get(rel_path_str).await {
+                let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
+                for (name, is_dir) in cached_entries {
+                    entries.push(Box::new(GmailDavDirEntry::new(&name, is_dir)));
+                }
+
+                let filtered_entries: Vec<_> = entries
+                    .into_iter()
+                    .filter(|e| {
+                        let name = String::from_utf8_lossy(&e.name()).to_string();
+                        let full_child_path = if rel_path_str.is_empty() {
+                            name
+                        } else {
+                            format!("{}/{}", rel_path_str, name)
+                        };
+                        !self.tombstones.contains(&full_child_path)
+                    })
+                    .collect();
+
+                let stream = futures::stream::iter(filtered_entries.into_iter().map(Ok));
+                return Ok(Box::pin(stream) as FsStream<Box<dyn DavDirEntry>>);
+            }
+
+            let mut raw_entries: Vec<(String, bool)> = Vec::new();
 
             if parts.is_empty() {
-                entries.push(Box::new(GmailDavDirEntry::new("00_MOUNT_CHECK_OK", false)));
-                entries.push(Box::new(GmailDavDirEntry::new("inbox", true)));
-                entries.push(Box::new(GmailDavDirEntry::new("unread", true)));
-                entries.push(Box::new(GmailDavDirEntry::new("outbox", true)));
-                entries.push(Box::new(GmailDavDirEntry::new("search", true)));
+                raw_entries.push(("00_MOUNT_CHECK_OK".to_string(), false));
+                raw_entries.push(("inbox".to_string(), true));
+                raw_entries.push(("unread".to_string(), true));
+                raw_entries.push(("outbox".to_string(), true));
+                raw_entries.push(("search".to_string(), true));
+                raw_entries.push(("saved_searches".to_string(), true));
             } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 1 {
-                let message_stubs = if parts[0] == "inbox" {
-                    self.client.list_inbox_messages(20).await
-                } else {
-                    self.client.list_unread_messages(20).await
-                }.map_err(|_| FsError::GeneralFailure)?;
-                
+                let message_stubs = {
+                    let _permit = self.api_semaphore.acquire().await;
+                    if parts[0] == "inbox" {
+                        self.client.list_inbox_messages(100).await
+                    } else {
+                        self.client.list_unread_messages(100).await
+                    }
+                }
+                .map_err(|_| FsError::GeneralFailure)?;
+
                 let mut detail_futures = futures::stream::iter(message_stubs)
                     .map(|stub| {
                         let client = self.client.clone();
-                        async move { client.get_message(stub.id.as_deref().unwrap_or_default()).await }
+                        let semaphore = self.api_semaphore.clone();
+                        async move {
+                            let _permit = semaphore.acquire().await;
+                            client
+                                .get_message(stub.id.as_deref().unwrap_or_default())
+                                .await
+                        }
                     })
                     .buffer_unordered(10);
 
                 while let Some(msg_res) = detail_futures.next().await {
                     if let Ok(msg) = msg_res {
                         let display_name = self.client.get_display_name(&msg);
-                        self.path_to_id.insert(display_name.clone(), msg.id.clone().unwrap_or_default());
-                        entries.push(Box::new(GmailDavDirEntry::new(&display_name, true)));
+                        self.path_to_id
+                            .insert(display_name.clone(), msg.id.clone().unwrap_or_default());
+                        raw_entries.push((display_name, true));
                     }
                 }
             } else if parts[0] == "outbox" && parts.len() == 1 {
                 // Outbox is normally empty until someone writes to it
-            } else if parts[0] == "search" && parts.len() == 1 {
-                entries.push(Box::new(GmailDavDirEntry::new("example-query", true)));
+            } else if (parts[0] == "search" || parts[0] == "saved_searches") && parts.len() == 1 {
+                if parts[0] == "search" {
+                    raw_entries.push(("example-query".to_string(), true));
+                }
                 for query in self.active_searches.iter() {
-                    entries.push(Box::new(GmailDavDirEntry::new(query.key(), true)));
+                    raw_entries.push((query.key().clone(), true));
                 }
             } else if parts[0] == "search" && parts.len() == 2 {
                 let query = parts[1];
                 info!("Executing live search for: {}", query);
-                let message_stubs = self.client.search_messages(query).await
-                    .map_err(|_| FsError::GeneralFailure)?;
-                
+                let message_stubs = {
+                    let _permit = self.api_semaphore.acquire().await;
+                    self.client.search_messages(query).await
+                }
+                .map_err(|_| FsError::GeneralFailure)?;
+
                 let mut detail_futures = futures::stream::iter(message_stubs)
                     .map(|stub| {
                         let client = self.client.clone();
-                        async move { client.get_message(stub.id.as_deref().unwrap_or_default()).await }
+                        let semaphore = self.api_semaphore.clone();
+                        async move {
+                            let _permit = semaphore.acquire().await;
+                            client
+                                .get_message(stub.id.as_deref().unwrap_or_default())
+                                .await
+                        }
                     })
                     .buffer_unordered(10);
 
                 while let Some(msg_res) = detail_futures.next().await {
                     if let Ok(msg) = msg_res {
                         let display_name = self.client.get_display_name(&msg);
-                        self.path_to_id.insert(display_name.clone(), msg.id.clone().unwrap_or_default());
-                        entries.push(Box::new(GmailDavDirEntry::new(&display_name, true)));
+                        self.path_to_id
+                            .insert(display_name.clone(), msg.id.clone().unwrap_or_default());
+                        raw_entries.push((display_name, true));
                     }
                 }
-            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 2) || (parts[0] == "search" && parts.len() == 3) {
-                entries.push(Box::new(GmailDavDirEntry::new("body.md", false)));
-                entries.push(Box::new(GmailDavDirEntry::new("body.html", false)));
-                entries.push(Box::new(GmailDavDirEntry::new("snippet.txt", false)));
-                entries.push(Box::new(GmailDavDirEntry::new("metadata.json", false)));
-                entries.push(Box::new(GmailDavDirEntry::new("attachments", true)));
-            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3 && parts[2] == "attachments") || 
-                      (parts[0] == "search" && parts.len() == 4 && parts[3] == "attachments") {
-                let msg_display_name = if parts[0] == "search" { parts[2] } else { parts[1] };
+            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 2)
+                || (parts[0] == "search" && parts.len() == 3)
+            {
+                raw_entries.push(("body.md".to_string(), false));
+                raw_entries.push(("body.html".to_string(), false));
+                raw_entries.push(("snippet.txt".to_string(), false));
+                raw_entries.push(("metadata.json".to_string(), false));
+                raw_entries.push(("attachments".to_string(), true));
+            } else if ((parts[0] == "inbox" || parts[0] == "unread")
+                && parts.len() == 3
+                && parts[2] == "attachments")
+                || (parts[0] == "search" && parts.len() == 4 && parts[3] == "attachments")
+            {
+                let msg_display_name = if parts[0] == "search" {
+                    parts[2]
+                } else {
+                    parts[1]
+                };
                 let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
-                let atts = self.client.get_attachments_list(&msg_id).await
-                    .map_err(|_| FsError::GeneralFailure)?;
+                let atts = {
+                    let _permit = self.api_semaphore.acquire().await;
+                    self.client
+                        .get_attachments_list(&msg_id)
+                        .await
+                        .map_err(|_| FsError::GeneralFailure)?
+                };
                 for att in atts {
-                    entries.push(Box::new(GmailDavDirEntry::new(&att.name, false)));
+                    raw_entries.push((att.name, false));
                 }
             }
 
-            let filtered_entries: Vec<_> = entries.into_iter().filter(|e| {
-                let name = String::from_utf8_lossy(&e.name()).to_string();
-                let full_child_path = if rel_path_str.is_empty() {
-                    name
-                } else {
-                    format!("{}/{}", rel_path_str, name)
-                };
-                !self.tombstones.contains(&full_child_path)
-            }).collect();
+            self.dir_cache
+                .insert(rel_path_str.to_string(), raw_entries.clone())
+                .await;
+
+            let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
+            for (name, is_dir) in raw_entries {
+                entries.push(Box::new(GmailDavDirEntry::new(&name, is_dir)));
+            }
+
+            let filtered_entries: Vec<_> = entries
+                .into_iter()
+                .filter(|e| {
+                    let name = String::from_utf8_lossy(&e.name()).to_string();
+                    let full_child_path = if rel_path_str.is_empty() {
+                        name
+                    } else {
+                        format!("{}/{}", rel_path_str, name)
+                    };
+                    !self.tombstones.contains(&full_child_path)
+                })
+                .collect();
 
             let stream = futures::stream::iter(filtered_entries.into_iter().map(Ok));
             Ok(Box::pin(stream) as FsStream<Box<dyn DavDirEntry>>)
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         async move {
             let rel_path = path.as_rel_ospath();
             let rel_path_str = rel_path.to_str().unwrap_or("");
-            
+
             if self.tombstones.contains(rel_path_str) {
                 return Err(FsError::NotFound);
             }
@@ -267,23 +412,39 @@ impl DavFileSystem for GmailDav {
 
             if parts.is_empty() {
                 is_dir = true;
-            } else if parts.len() == 1 && (parts[0] == "inbox" || parts[0] == "unread" || parts[0] == "search" || parts[0] == "outbox") {
+            } else if parts.len() == 1
+                && (parts[0] == "inbox"
+                    || parts[0] == "unread"
+                    || parts[0] == "search"
+                    || parts[0] == "saved_searches"
+                    || parts[0] == "outbox")
+            {
                 is_dir = true;
             } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 2 {
                 is_dir = true;
-            } else if parts[0] == "search" && parts.len() == 2 {
+            } else if (parts[0] == "search" || parts[0] == "saved_searches") && parts.len() == 2 {
                 is_dir = parts[1] == "example-query" || self.active_searches.contains(parts[1]);
             } else if parts[0] == "search" && parts.len() == 3 {
                 is_dir = true;
-            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3 && parts[2] == "attachments") || (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments") {
+            } else if ((parts[0] == "inbox" || parts[0] == "unread")
+                && parts.len() == 3
+                && parts[2] == "attachments")
+                || (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments")
+            {
                 is_dir = true;
             } else if parts.len() == 1 && parts[0] == "00_MOUNT_CHECK_OK" {
                 is_file = true;
             } else if parts[0] == "outbox" && parts.len() == 2 {
                 is_file = true;
-            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3) || (parts.len() == 4 && parts[0] == "search") {
+            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3)
+                || (parts.len() == 4 && parts[0] == "search")
+            {
                 is_file = true;
-            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 4 && parts[2] == "attachments") || (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments") {
+            } else if ((parts[0] == "inbox" || parts[0] == "unread")
+                && parts.len() == 4
+                && parts[2] == "attachments")
+                || (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments")
+            {
                 is_file = true;
             }
 
@@ -298,26 +459,54 @@ impl DavFileSystem for GmailDav {
                     return Ok(Box::new(GmailDavMetaData::new(false, 0)) as Box<dyn DavMetaData>);
                 }
 
-                let (msg_display_name, file_name, is_attachment) = if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 4 && parts[2] == "attachments" {
+                let (msg_display_name, file_name, is_attachment) = if (parts[0] == "inbox"
+                    || parts[0] == "unread")
+                    && parts.len() == 4
+                    && parts[2] == "attachments"
+                {
                     (parts[1], parts[3], true)
                 } else if parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments" {
                     (parts[2], parts[4], true)
+                } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3 {
+                    (parts[1], parts[2], false)
+                } else if parts.len() == 4 && parts[0] == "search" {
+                    (parts[2], parts[3], false)
                 } else {
                     ("", "", false)
                 };
 
                 if is_attachment {
                     let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
-                    let atts = self.client.get_attachments_list(&msg_id).await.map_err(|_| FsError::GeneralFailure)?;
-                    let att = atts.into_iter().find(|a| a.name == file_name).ok_or(FsError::NotFound)?;
-                    return Ok(Box::new(GmailDavMetaData::new(false, att.size)) as Box<dyn DavMetaData>);
+                    let atts = {
+                        let _permit = self.api_semaphore.acquire().await;
+                        self.client
+                            .get_attachments_list(&msg_id)
+                            .await
+                            .map_err(|_| FsError::GeneralFailure)?
+                    };
+                    let att = atts
+                        .into_iter()
+                        .find(|a| a.name == file_name)
+                        .ok_or(FsError::NotFound)?;
+                    return Ok(
+                        Box::new(GmailDavMetaData::new(false, att.size)) as Box<dyn DavMetaData>
+                    );
                 }
 
-                Ok(Box::new(GmailDavMetaData::new(false, 1024)) as Box<dyn DavMetaData>)
+                if file_name == "body.md"
+                    || file_name == "body.html"
+                    || file_name == "snippet.txt"
+                    || file_name == "metadata.json"
+                {
+                    return Ok(Box::new(GmailDavMetaData::new(false, 1024)) as Box<dyn DavMetaData>);
+                }
+
+                Err(FsError::NotFound)
             } else {
                 Err(FsError::NotFound)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
@@ -325,21 +514,24 @@ impl DavFileSystem for GmailDav {
             let rel_path = path.as_rel_ospath();
             let rel_path_str = rel_path.to_str().unwrap_or("");
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
-            
+
             info!("create_dir: path={:?} parts={:?}", rel_path, parts);
             self.tombstones.remove(rel_path_str);
 
-            if parts.len() == 2 && parts[0] == "search" {
+            if parts.len() == 2 && (parts[0] == "search" || parts[0] == "saved_searches") {
                 let query = parts[1].to_string();
                 if !self.active_searches.contains(&query) {
                     info!("Registered magic search node: {}", query);
                     self.active_searches.insert(query);
+                    self.dir_cache.invalidate("search").await;
+                    self.dir_cache.invalidate("saved_searches").await;
                 }
                 Ok(())
             } else {
                 Err(FsError::Forbidden)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
@@ -349,35 +541,59 @@ impl DavFileSystem for GmailDav {
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             info!("remove_dir: path={:?} parts={:?}", rel_path, parts);
 
-            if parts.len() == 2 && parts[0] == "search" {
+            if parts.len() == 2 && (parts[0] == "search" || parts[0] == "saved_searches") {
                 self.active_searches.remove(parts[1]);
-                self.tombstones.insert(rel_path_str.to_string());
+                // No tombstone needed; removal from active_searches + cache invalidation is enough
+                self.dir_cache.invalidate("search").await;
+                self.dir_cache.invalidate("saved_searches").await;
                 Ok(())
-            } else if (parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread")) || (parts.len() == 3 && parts[0] == "search") {
-                let msg_display_name = if parts[0] == "search" { parts[2] } else { parts[1] };
+            } else if (parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread"))
+                || (parts.len() == 3 && parts[0] == "search")
+            {
+                let msg_display_name = if parts[0] == "search" {
+                    parts[2]
+                } else {
+                    parts[1]
+                };
                 let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
                 self.client.trash_message(&msg_id).await.map_err(|e| {
                     error!("Trash failed: {}", e);
                     FsError::GeneralFailure
                 })?;
-                
-                self.tombstones.insert(rel_path_str.to_string());
-                let to_remove: Vec<String> = self.tombstones.iter()
+
+                // No tombstone needed for the folder itself as it's gone from the API
+                let to_remove: Vec<String> = self
+                    .tombstones
+                    .iter()
                     .filter(|p| p.starts_with(&format!("{}/", rel_path_str)))
                     .map(|p| p.clone())
                     .collect();
                 for p in to_remove {
                     self.tombstones.remove(&p);
                 }
+
+                // Invalidate parent directory cache
+                if parts[0] == "search" {
+                    self.dir_cache
+                        .invalidate(&format!("search/{}", parts[1]))
+                        .await;
+                } else {
+                    self.dir_cache.invalidate(parts[0]).await;
+                }
                 Ok(())
-            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3 && parts[2] == "attachments") ||
-                      (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments") {
+            } else if ((parts[0] == "inbox" || parts[0] == "unread")
+                && parts.len() == 3
+                && parts[2] == "attachments")
+                || (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments")
+            {
+                // Deleting the "attachments" folder itself
                 self.tombstones.insert(rel_path_str.to_string());
                 Ok(())
             } else {
                 Err(FsError::Forbidden)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn remove_file<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
@@ -387,32 +603,51 @@ impl DavFileSystem for GmailDav {
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             info!("remove_file: path={:?} parts={:?}", rel_path, parts);
 
-            if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3) || 
-               (parts.len() == 4 && parts[0] == "search") ||
-               ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 4 && parts[2] == "attachments") ||
-               (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments") ||
-               (parts[0] == "outbox") {
+            if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3)
+                || (parts.len() == 4 && parts[0] == "search")
+                || ((parts[0] == "inbox" || parts[0] == "unread")
+                    && parts.len() == 4
+                    && parts[2] == "attachments")
+                || (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments")
+                || (parts[0] == "outbox")
+            {
                 self.tombstones.insert(rel_path_str.to_string());
+                self.dir_cache.invalidate(parts[0]).await;
+                if parts[0] == "search" && parts.len() >= 2 {
+                    self.dir_cache
+                        .invalidate(&format!("{}/{}", parts[0], parts[1]))
+                        .await;
+                }
                 Ok(())
             } else {
                 Err(FsError::Forbidden)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn rename<'a>(&'a self, from: &'a DavPath, _to: &'a DavPath) -> FsFuture<'a, ()> {
         async move {
             let rel_path = from.as_rel_ospath();
-            let parts: Vec<&str> = rel_path.to_str().unwrap_or("").split('/').filter(|s| !s.is_empty()).collect();
-            
+            let parts: Vec<&str> = rel_path
+                .to_str()
+                .unwrap_or("")
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+
             if parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread") {
                 let msg_id = self.resolve_id(parts[1]).ok_or(FsError::NotFound)?;
-                self.client.archive_message(&msg_id).await.map_err(|_| FsError::GeneralFailure)?;
+                self.client
+                    .archive_message(&msg_id)
+                    .await
+                    .map_err(|_| FsError::GeneralFailure)?;
                 Ok(())
             } else {
                 Err(FsError::Forbidden)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 }
 
@@ -429,9 +664,15 @@ impl GmailDavMetaData {
 }
 
 impl DavMetaData for GmailDavMetaData {
-    fn len(&self) -> u64 { self.size }
-    fn modified(&self) -> FsResult<SystemTime> { Ok(SystemTime::now()) }
-    fn is_dir(&self) -> bool { self.is_dir }
+    fn len(&self) -> u64 {
+        self.size
+    }
+    fn modified(&self) -> FsResult<SystemTime> {
+        Ok(SystemTime::now())
+    }
+    fn is_dir(&self) -> bool {
+        self.is_dir
+    }
 }
 
 struct GmailDavDirEntry {
@@ -441,16 +682,20 @@ struct GmailDavDirEntry {
 
 impl GmailDavDirEntry {
     fn new(name: &str, is_dir: bool) -> Self {
-        Self { name: name.to_string(), is_dir }
+        Self {
+            name: name.to_string(),
+            is_dir,
+        }
     }
 }
 
 impl DavDirEntry for GmailDavDirEntry {
-    fn name(&self) -> Vec<u8> { self.name.as_bytes().to_vec() }
+    fn name(&self) -> Vec<u8> {
+        self.name.as_bytes().to_vec()
+    }
     fn metadata(&self) -> FsFuture<'_, Box<dyn DavMetaData>> {
-        async move {
-            Ok(Box::new(GmailDavMetaData::new(self.is_dir, 0)) as Box<dyn DavMetaData>)
-        }.boxed()
+        async move { Ok(Box::new(GmailDavMetaData::new(self.is_dir, 0)) as Box<dyn DavMetaData>) }
+            .boxed()
     }
 }
 
@@ -468,17 +713,24 @@ impl DavFile for GmailDavFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         async move {
             if let Some(content) = &self.content {
-                Ok(Box::new(GmailDavMetaData::new(false, content.len() as u64)) as Box<dyn DavMetaData>)
+                Ok(Box::new(GmailDavMetaData::new(false, content.len() as u64))
+                    as Box<dyn DavMetaData>)
             } else if let Some(size) = self.size {
                 Ok(Box::new(GmailDavMetaData::new(false, size)) as Box<dyn DavMetaData>)
             } else if self.write_buffer.is_some() {
                 Ok(Box::new(GmailDavMetaData::new(false, 0)) as Box<dyn DavMetaData>)
             } else {
+                // If we reach here, we are likely handling a GET request for a file
+                // where we only had a dummy size. We MUST download the real content
+                // now to provide an accurate Content-Length header, otherwise
+                // the file will be truncated by the client.
                 let content = self.dav.get_content_bytes(&self.path).await?;
                 let size = content.len() as u64;
+                self.content = Some(content);
                 Ok(Box::new(GmailDavMetaData::new(false, size)) as Box<dyn DavMetaData>)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn write_buf(&mut self, buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
@@ -496,7 +748,8 @@ impl DavFile for GmailDavFile {
             } else {
                 Err(FsError::Forbidden)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn write_bytes(&mut self, buf: Bytes) -> FsFuture<'_, ()> {
@@ -508,7 +761,8 @@ impl DavFile for GmailDavFile {
             } else {
                 Err(FsError::Forbidden)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn read_bytes(&mut self, count: usize) -> FsFuture<'_, Bytes> {
@@ -521,9 +775,15 @@ impl DavFile for GmailDavFile {
             let end = std::cmp::min(start + count, content.len());
             let chunk = content.slice(start..end);
             self.pos = end;
-            debug!("read_bytes: pos={} count={} returning={}", start, count, chunk.len());
+            debug!(
+                "read_bytes: pos={} count={} returning={}",
+                start,
+                count,
+                chunk.len()
+            );
             Ok(chunk)
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn seek(&mut self, pos: SeekFrom) -> FsFuture<'_, u64> {
@@ -546,7 +806,8 @@ impl DavFile for GmailDavFile {
             } else {
                 Ok(0)
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
@@ -554,7 +815,7 @@ impl DavFile for GmailDavFile {
             if let Some(buffer) = &self.write_buffer {
                 let data = buffer.lock().await;
                 let content = String::from_utf8_lossy(&data).to_string();
-                
+
                 // Parse headers and body
                 let mut to = String::new();
                 let mut subject = String::new();
@@ -580,11 +841,18 @@ impl DavFile for GmailDavFile {
 
                 if !to.is_empty() {
                     info!("Flush triggered send to: {}", to);
-                    self.dav.client.send_email(&to, &subject, &body).await
-                        .map_err(|e| { error!("Send failed: {}", e); FsError::GeneralFailure })?;
+                    self.dav
+                        .client
+                        .send_email(&to, &subject, &body)
+                        .await
+                        .map_err(|e| {
+                            error!("Send failed: {}", e);
+                            FsError::GeneralFailure
+                        })?;
                 }
             }
             Ok(())
-        }.boxed()
+        }
+        .boxed()
     }
 }

@@ -58,8 +58,8 @@ impl GmailClient {
 
         let hub = Gmail::new(hub_client, auth);
         let message_cache = Cache::builder()
-            .time_to_live(Duration::from_secs(60))
-            .max_capacity(100)
+            .time_to_live(Duration::from_secs(86400)) // 24 hours
+            .max_capacity(5000)
             .build();
 
         Ok(Self { hub, message_cache })
