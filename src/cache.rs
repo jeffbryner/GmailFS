@@ -1,9 +1,9 @@
-use moka::future::Cache;
-use std::time::Duration;
 use bytes::Bytes;
-use std::future::Future;
-use dav_server::fs::{FsResult, FsError};
+use dav_server::fs::{FsError, FsResult};
+use moka::future::Cache;
 use std::fmt;
+use std::future::Future;
+use std::time::Duration;
 
 pub struct BodyCache {
     cache: Cache<String, Bytes>,
@@ -19,8 +19,11 @@ impl BodyCache {
     pub fn new() -> Self {
         Self {
             cache: Cache::builder()
-                .time_to_live(Duration::from_secs(600))
-                .max_capacity(200)
+                // Cache for 24 hours since email content is static
+                .time_to_live(Duration::from_secs(86400))
+                // Max 256 MB of cached bodies/attachments
+                .weigher(|_k, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX))
+                .max_capacity(256 * 1024 * 1024)
                 .build(),
         }
     }
@@ -30,9 +33,13 @@ impl BodyCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = FsResult<Bytes>>,
     {
-        let res = self.cache.get_with(key, async move {
-            f().await.unwrap_or_else(|_| Bytes::new())
-        }).await;
+        let res = self
+            .cache
+            .get_with(
+                key,
+                async move { f().await.unwrap_or_else(|_| Bytes::new()) },
+            )
+            .await;
 
         if res.is_empty() {
             Err(FsError::GeneralFailure)
