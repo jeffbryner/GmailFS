@@ -11,6 +11,7 @@ use moka::future::Cache;
 use serde_json::json;
 use std::fmt;
 use std::io::Cursor;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -47,12 +48,43 @@ impl GmailClient {
         let hub_client: common::Client<google_gmail1::hyper_rustls::HttpsConnector<HttpConnector>> =
             Client::builder(executor).build(connector);
 
+        let proj_dirs = directories::ProjectDirs::from("", "", "gmailfs")
+            .ok_or_else(|| anyhow::anyhow!("Could not determine configuration directory"))?;
+        let config_dir = proj_dirs.config_dir();
+
+        #[cfg(unix)]
+        {
+            if !config_dir.exists() {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(config_dir)?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if !config_dir.exists() {
+                std::fs::create_dir_all(config_dir)?;
+            }
+        }
+
+        let token_path = config_dir.join("gmailfs_tokens.json");
+
+        #[cfg(unix)]
+        {
+            // We only create the directory if it doesn't exist.
+            // We should NOT create the file itself as an empty file,
+            // because yup_oauth2 expects either a valid JSON file or no file at all.
+            // If it sees an empty file, it throws "EOF while parsing a value".
+            // yup_oauth2 will create the file when it needs to save tokens.
+        }
+
         let auth = yup_oauth2::InstalledFlowAuthenticator::with_client(
             secret,
             yup_oauth2::InstalledFlowReturnMethod::HTTPRedirect,
             yup_oauth2::client::CustomHyperClientBuilder::from(auth_client),
         )
-        .persist_tokens_to_disk("gmailfs_tokens.json")
+        .persist_tokens_to_disk(token_path)
         .build()
         .await?;
 

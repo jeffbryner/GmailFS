@@ -15,6 +15,8 @@ use std::time::SystemTime;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info};
 
+const MAX_OUTBOX_FILE_SIZE: usize = 10 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct GmailDav {
     client: Arc<GmailClient>,
@@ -733,16 +735,18 @@ impl DavFile for GmailDavFile {
         .boxed()
     }
 
-    fn write_buf(&mut self, buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
+    fn write_buf(&mut self, mut buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
         async move {
             if let Some(buffer) = &self.write_buffer {
                 let mut buffer = buffer.lock().await;
-                let mut b = buf;
-                while b.has_remaining() {
-                    let chunk = b.chunk();
+                while buf.has_remaining() {
+                    let chunk = buf.chunk();
+                    if buffer.len() + chunk.len() > MAX_OUTBOX_FILE_SIZE {
+                        return Err(FsError::TooLarge);
+                    }
                     buffer.extend_from_slice(chunk);
                     let len = chunk.len();
-                    b.advance(len);
+                    buf.advance(len);
                 }
                 Ok(())
             } else {
@@ -756,6 +760,9 @@ impl DavFile for GmailDavFile {
         async move {
             if let Some(buffer) = &self.write_buffer {
                 let mut buffer = buffer.lock().await;
+                if buffer.len() + buf.len() > MAX_OUTBOX_FILE_SIZE {
+                    return Err(FsError::TooLarge);
+                }
                 buffer.extend_from_slice(&buf);
                 Ok(())
             } else {
