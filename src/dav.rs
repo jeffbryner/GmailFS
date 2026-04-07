@@ -185,13 +185,25 @@ impl DavFileSystem for GmailDav {
                 }) as Box<dyn DavFile>);
             }
 
-            // Lazy loading: return a file handle without pre-fetching bytes.
-            // Retrieval happens on-demand in read_bytes/seek/metadata.
+            // Lazy loading: verify existence and get metadata first,
+            // but return a file handle without pre-fetching content bytes.
+            // Full download happens on-demand in read_bytes/seek/metadata.
+            let meta = self.metadata(path).await?;
+
+            // If the metadata returned a dummy size (1024), we set size to None
+            // so that DavFile::metadata will trigger a real download to get the true size
+            // for the Content-Length header during GET requests.
+            let size = if meta.len() == 1024 {
+                None
+            } else {
+                Some(meta.len())
+            };
+
             Ok(Box::new(GmailDavFile {
                 dav: self.clone(),
                 path: path.clone(),
                 content: None,
-                size: None,
+                size,
                 pos: 0,
                 write_buffer: None,
             }) as Box<dyn DavFile>)
@@ -446,6 +458,10 @@ impl DavFileSystem for GmailDav {
                     (parts[1], parts[3], true)
                 } else if parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments" {
                     (parts[2], parts[4], true)
+                } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3 {
+                    (parts[1], parts[2], false)
+                } else if parts.len() == 4 && parts[0] == "search" {
+                    (parts[2], parts[3], false)
                 } else {
                     ("", "", false)
                 };
@@ -468,7 +484,15 @@ impl DavFileSystem for GmailDav {
                     );
                 }
 
-                Ok(Box::new(GmailDavMetaData::new(false, 1024)) as Box<dyn DavMetaData>)
+                if file_name == "body.md"
+                    || file_name == "body.html"
+                    || file_name == "snippet.txt"
+                    || file_name == "metadata.json"
+                {
+                    return Ok(Box::new(GmailDavMetaData::new(false, 1024)) as Box<dyn DavMetaData>);
+                }
+
+                Err(FsError::NotFound)
             } else {
                 Err(FsError::NotFound)
             }
@@ -667,9 +691,14 @@ impl DavFile for GmailDavFile {
             } else if self.write_buffer.is_some() {
                 Ok(Box::new(GmailDavMetaData::new(false, 0)) as Box<dyn DavMetaData>)
             } else {
-                // If we don't have content yet, don't trigger a full download
-                // just to satisfy a metadata request. Fall back to GmailDav::metadata.
-                self.dav.metadata(&self.path).await
+                // If we reach here, we are likely handling a GET request for a file
+                // where we only had a dummy size. We MUST download the real content
+                // now to provide an accurate Content-Length header, otherwise
+                // the file will be truncated by the client.
+                let content = self.dav.get_content_bytes(&self.path).await?;
+                let size = content.len() as u64;
+                self.content = Some(content);
+                Ok(Box::new(GmailDavMetaData::new(false, size)) as Box<dyn DavMetaData>)
             }
         }
         .boxed()
