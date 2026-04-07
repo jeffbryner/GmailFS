@@ -290,7 +290,9 @@ impl DavFileSystem for GmailDav {
             } else if parts[0] == "search" && parts.len() == 1 {
                 raw_entries.push(("example-query".to_string(), true));
                 for query in self.active_searches.iter() {
-                    raw_entries.push((query.key().clone(), true));
+                    let q = query.key().clone();
+                    raw_entries.push((q.clone(), true));
+                    raw_entries.push((format!("{}.query", q), false));
                 }
             } else if parts[0] == "search" && parts.len() == 2 {
                 let query = parts[1];
@@ -414,7 +416,12 @@ impl DavFileSystem for GmailDav {
             } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 2 {
                 is_dir = true;
             } else if parts[0] == "search" && parts.len() == 2 {
-                is_dir = parts[1] == "example-query" || self.active_searches.contains(parts[1]);
+                if parts[1].ends_with(".query") {
+                    let query = parts[1].trim_end_matches(".query");
+                    is_file = self.active_searches.contains(query);
+                } else {
+                    is_dir = parts[1] == "example-query" || self.active_searches.contains(parts[1]);
+                }
             } else if parts[0] == "search" && parts.len() == 3 {
                 is_dir = true;
             } else if ((parts[0] == "inbox" || parts[0] == "unread")
@@ -447,6 +454,10 @@ impl DavFileSystem for GmailDav {
                 }
 
                 if parts[0] == "outbox" {
+                    return Ok(Box::new(GmailDavMetaData::new(false, 0)) as Box<dyn DavMetaData>);
+                }
+
+                if parts.len() == 2 && parts[0] == "search" && parts[1].ends_with(".query") {
                     return Ok(Box::new(GmailDavMetaData::new(false, 0)) as Box<dyn DavMetaData>);
                 }
 
@@ -579,6 +590,12 @@ impl DavFileSystem for GmailDav {
             let rel_path_str = rel_path.to_str().unwrap_or("");
             let parts: Vec<&str> = rel_path_str.split('/').filter(|s| !s.is_empty()).collect();
             info!("remove_file: path={:?} parts={:?}", rel_path, parts);
+
+            if parts.len() == 2 && parts[0] == "search" && parts[1].ends_with(".query") {
+                let query = parts[1].trim_end_matches(".query");
+                self.active_searches.remove(query);
+                return Ok(());
+            }
 
             if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3)
                 || (parts.len() == 4 && parts[0] == "search")
