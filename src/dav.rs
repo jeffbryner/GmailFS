@@ -10,8 +10,7 @@ use moka::future::Cache;
 use std::fmt;
 use std::io::SeekFrom;
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info};
 
@@ -25,7 +24,7 @@ pub struct GmailDav {
     active_searches: Arc<DashSet<String>>,
     tombstones: Arc<DashSet<String>>,
     api_semaphore: Arc<Semaphore>,
-    dir_cache: Arc<Cache<String, Vec<(String, bool)>>>,
+    dir_cache: Arc<Cache<String, Vec<(String, bool, SystemTime)>>>,
 }
 
 impl fmt::Debug for GmailDav {
@@ -187,6 +186,7 @@ impl DavFileSystem for GmailDav {
                     path: path.clone(),
                     content: None,
                     size: None,
+                    modified: SystemTime::now(),
                     pos: 0,
                     write_buffer: Some(Arc::new(Mutex::new(Vec::new()))),
                 }) as Box<dyn DavFile>);
@@ -211,6 +211,7 @@ impl DavFileSystem for GmailDav {
                 path: path.clone(),
                 content: None,
                 size,
+                modified: meta.modified().unwrap_or_else(|_| SystemTime::now()),
                 pos: 0,
                 write_buffer: None,
             }) as Box<dyn DavFile>)
@@ -231,8 +232,10 @@ impl DavFileSystem for GmailDav {
 
             if let Some(cached_entries) = self.dir_cache.get(rel_path_str).await {
                 let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
-                for (name, is_dir) in cached_entries {
-                    entries.push(Box::new(GmailDavDirEntry::new(&name, is_dir)));
+                for (name, is_dir, modified) in cached_entries {
+                    entries.push(Box::new(GmailDavDirEntry::new_with_time(
+                        &name, is_dir, modified,
+                    )));
                 }
 
                 let filtered_entries: Vec<_> = entries
@@ -252,15 +255,16 @@ impl DavFileSystem for GmailDav {
                 return Ok(Box::pin(stream) as FsStream<Box<dyn DavDirEntry>>);
             }
 
-            let mut raw_entries: Vec<(String, bool)> = Vec::new();
+            let mut raw_entries: Vec<(String, bool, SystemTime)> = Vec::new();
 
             if parts.is_empty() {
-                raw_entries.push(("00_MOUNT_CHECK_OK".to_string(), false));
-                raw_entries.push(("inbox".to_string(), true));
-                raw_entries.push(("unread".to_string(), true));
-                raw_entries.push(("outbox".to_string(), true));
-                raw_entries.push(("search".to_string(), true));
-                raw_entries.push(("saved_searches".to_string(), true));
+                let now = SystemTime::now();
+                raw_entries.push(("00_MOUNT_CHECK_OK".to_string(), false, now));
+                raw_entries.push(("inbox".to_string(), true, now));
+                raw_entries.push(("unread".to_string(), true, now));
+                raw_entries.push(("outbox".to_string(), true, now));
+                raw_entries.push(("search".to_string(), true, now));
+                raw_entries.push(("saved_searches".to_string(), true, now));
             } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 1 {
                 let message_stubs = {
                     let _permit = self.api_semaphore.acquire().await;
@@ -290,17 +294,25 @@ impl DavFileSystem for GmailDav {
                         let display_name = self.client.get_display_name(&msg);
                         self.path_to_id
                             .insert(display_name.clone(), msg.id.clone().unwrap_or_default());
-                        raw_entries.push((display_name, true));
+
+                        let modified = if let Some(internal_date) = msg.internal_date {
+                            SystemTime::UNIX_EPOCH + Duration::from_millis(internal_date as u64)
+                        } else {
+                            SystemTime::now()
+                        };
+
+                        raw_entries.push((display_name, true, modified));
                     }
                 }
             } else if parts[0] == "outbox" && parts.len() == 1 {
                 // Outbox is normally empty until someone writes to it
             } else if (parts[0] == "search" || parts[0] == "saved_searches") && parts.len() == 1 {
+                let now = SystemTime::now();
                 if parts[0] == "search" {
-                    raw_entries.push(("example-query".to_string(), true));
+                    raw_entries.push(("example-query".to_string(), true, now));
                 }
                 for query in self.active_searches.iter() {
-                    raw_entries.push((query.key().clone(), true));
+                    raw_entries.push((query.key().clone(), true, now));
                 }
             } else if parts[0] == "search" && parts.len() == 2 {
                 let query = parts[1];
@@ -329,21 +341,48 @@ impl DavFileSystem for GmailDav {
                         let display_name = self.client.get_display_name(&msg);
                         self.path_to_id
                             .insert(display_name.clone(), msg.id.clone().unwrap_or_default());
-                        raw_entries.push((display_name, true));
+
+                        let modified = if let Some(internal_date) = msg.internal_date {
+                            SystemTime::UNIX_EPOCH + Duration::from_millis(internal_date as u64)
+                        } else {
+                            SystemTime::now()
+                        };
+
+                        raw_entries.push((display_name, true, modified));
                     }
                 }
-            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 2)
-                || (parts[0] == "search" && parts.len() == 3)
+            } else if (parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread"))
+                || (parts.len() == 3 && parts[0] == "search")
             {
-                raw_entries.push(("body.md".to_string(), false));
-                raw_entries.push(("body.html".to_string(), false));
-                raw_entries.push(("snippet.txt".to_string(), false));
-                raw_entries.push(("metadata.json".to_string(), false));
-                raw_entries.push(("attachments".to_string(), true));
-            } else if ((parts[0] == "inbox" || parts[0] == "unread")
-                && parts.len() == 3
+                let msg_display_name = if parts[0] == "search" {
+                    parts[2]
+                } else {
+                    parts[1]
+                };
+
+                let modified = if let Some(id) = self.resolve_id(msg_display_name) {
+                    if let Ok(msg) = self.client.get_message(&id).await {
+                        if let Some(internal_date) = msg.internal_date {
+                            SystemTime::UNIX_EPOCH + Duration::from_millis(internal_date as u64)
+                        } else {
+                            SystemTime::now()
+                        }
+                    } else {
+                        SystemTime::now()
+                    }
+                } else {
+                    SystemTime::now()
+                };
+
+                raw_entries.push(("body.md".to_string(), false, modified));
+                raw_entries.push(("body.html".to_string(), false, modified));
+                raw_entries.push(("snippet.txt".to_string(), false, modified));
+                raw_entries.push(("metadata.json".to_string(), false, modified));
+                raw_entries.push(("attachments".to_string(), true, modified));
+            } else if (parts.len() == 3
+                && (parts[0] == "inbox" || parts[0] == "unread")
                 && parts[2] == "attachments")
-                || (parts[0] == "search" && parts.len() == 4 && parts[3] == "attachments")
+                || (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments")
             {
                 let msg_display_name = if parts[0] == "search" {
                     parts[2]
@@ -351,6 +390,17 @@ impl DavFileSystem for GmailDav {
                     parts[1]
                 };
                 let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
+
+                let modified = if let Ok(msg) = self.client.get_message(&msg_id).await {
+                    if let Some(internal_date) = msg.internal_date {
+                        SystemTime::UNIX_EPOCH + Duration::from_millis(internal_date as u64)
+                    } else {
+                        SystemTime::now()
+                    }
+                } else {
+                    SystemTime::now()
+                };
+
                 let atts = {
                     let _permit = self.api_semaphore.acquire().await;
                     self.client
@@ -359,7 +409,7 @@ impl DavFileSystem for GmailDav {
                         .map_err(|_| FsError::GeneralFailure)?
                 };
                 for att in atts {
-                    raw_entries.push((att.name, false));
+                    raw_entries.push((att.name, false, modified));
                 }
             }
 
@@ -368,8 +418,10 @@ impl DavFileSystem for GmailDav {
                 .await;
 
             let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
-            for (name, is_dir) in raw_entries {
-                entries.push(Box::new(GmailDavDirEntry::new(&name, is_dir)));
+            for (name, is_dir, modified) in raw_entries {
+                entries.push(Box::new(GmailDavDirEntry::new_with_time(
+                    &name, is_dir, modified,
+                )));
             }
 
             let filtered_entries: Vec<_> = entries
@@ -422,28 +474,28 @@ impl DavFileSystem for GmailDav {
                     || parts[0] == "outbox")
             {
                 is_dir = true;
-            } else if (parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 2 {
+            } else if parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread") {
                 is_dir = true;
-            } else if (parts[0] == "search" || parts[0] == "saved_searches") && parts.len() == 2 {
+            } else if parts.len() == 2 && (parts[0] == "search" || parts[0] == "saved_searches") {
                 is_dir = parts[1] == "example-query" || self.active_searches.contains(parts[1]);
-            } else if parts[0] == "search" && parts.len() == 3 {
+            } else if parts.len() == 3 && parts[0] == "search" {
                 is_dir = true;
-            } else if ((parts[0] == "inbox" || parts[0] == "unread")
-                && parts.len() == 3
+            } else if (parts.len() == 3
+                && (parts[0] == "inbox" || parts[0] == "unread")
                 && parts[2] == "attachments")
                 || (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments")
             {
                 is_dir = true;
             } else if parts.len() == 1 && parts[0] == "00_MOUNT_CHECK_OK" {
                 is_file = true;
-            } else if parts[0] == "outbox" && parts.len() == 2 {
+            } else if parts.len() == 2 && parts[0] == "outbox" {
                 is_file = true;
-            } else if ((parts[0] == "inbox" || parts[0] == "unread") && parts.len() == 3)
+            } else if (parts.len() == 3 && (parts[0] == "inbox" || parts[0] == "unread"))
                 || (parts.len() == 4 && parts[0] == "search")
             {
                 is_file = true;
-            } else if ((parts[0] == "inbox" || parts[0] == "unread")
-                && parts.len() == 4
+            } else if (parts.len() == 4
+                && (parts[0] == "inbox" || parts[0] == "unread")
                 && parts[2] == "attachments")
                 || (parts.len() == 5 && parts[0] == "search" && parts[3] == "attachments")
             {
@@ -451,7 +503,61 @@ impl DavFileSystem for GmailDav {
             }
 
             if is_dir {
-                Ok(Box::new(GmailDavMetaData::new(true, 0)) as Box<dyn DavMetaData>)
+                let modified = if parts.len() == 2 && (parts[0] == "inbox" || parts[0] == "unread") {
+                    if let Some(id) = self.resolve_id(parts[1]) {
+                        if let Ok(msg) = self.client.get_message(&id).await {
+                            if let Some(internal_date) = msg.internal_date {
+                                SystemTime::UNIX_EPOCH + Duration::from_millis(internal_date as u64)
+                            } else {
+                                SystemTime::now()
+                            }
+                        } else {
+                            SystemTime::now()
+                        }
+                    } else {
+                        SystemTime::now()
+                    }
+                } else if parts.len() == 3 && parts[0] == "search" {
+                    if let Some(id) = self.resolve_id(parts[2]) {
+                        if let Ok(msg) = self.client.get_message(&id).await {
+                            if let Some(internal_date) = msg.internal_date {
+                                SystemTime::UNIX_EPOCH + Duration::from_millis(internal_date as u64)
+                            } else {
+                                SystemTime::now()
+                            }
+                        } else {
+                            SystemTime::now()
+                        }
+                    } else {
+                        SystemTime::now()
+                    }
+                } else if (parts.len() == 3
+                    && (parts[0] == "inbox" || parts[0] == "unread")
+                    && parts[2] == "attachments")
+                    || (parts.len() == 4 && parts[0] == "search" && parts[3] == "attachments")
+                {
+                    let msg_display_name = if parts[0] == "search" {
+                        parts[2]
+                    } else {
+                        parts[1]
+                    };
+                    if let Some(id) = self.resolve_id(msg_display_name) {
+                        if let Ok(msg) = self.client.get_message(&id).await {
+                            if let Some(internal_date) = msg.internal_date {
+                                SystemTime::UNIX_EPOCH + Duration::from_millis(internal_date as u64)
+                            } else {
+                                SystemTime::now()
+                            }
+                        } else {
+                            SystemTime::now()
+                        }
+                    } else {
+                        SystemTime::now()
+                    }
+                } else {
+                    SystemTime::now()
+                };
+                Ok(Box::new(GmailDavMetaData::new_with_time(true, 0, modified)) as Box<dyn DavMetaData>)
             } else if is_file {
                 if parts[0] == "00_MOUNT_CHECK_OK" {
                     return Ok(Box::new(GmailDavMetaData::new(false, 2)) as Box<dyn DavMetaData>);
@@ -477,8 +583,18 @@ impl DavFileSystem for GmailDav {
                     ("", "", false)
                 };
 
+                let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
+                let modified = if let Ok(msg) = self.client.get_message(&msg_id).await {
+                    if let Some(internal_date) = msg.internal_date {
+                        SystemTime::UNIX_EPOCH + Duration::from_millis(internal_date as u64)
+                    } else {
+                        SystemTime::now()
+                    }
+                } else {
+                    SystemTime::now()
+                };
+
                 if is_attachment {
-                    let msg_id = self.resolve_id(msg_display_name).ok_or(FsError::NotFound)?;
                     let atts = {
                         let _permit = self.api_semaphore.acquire().await;
                         self.client
@@ -490,9 +606,9 @@ impl DavFileSystem for GmailDav {
                         .into_iter()
                         .find(|a| a.name == file_name)
                         .ok_or(FsError::NotFound)?;
-                    return Ok(
-                        Box::new(GmailDavMetaData::new(false, att.size)) as Box<dyn DavMetaData>
-                    );
+                    return Ok(Box::new(GmailDavMetaData::new_with_time(
+                        false, att.size, modified,
+                    )) as Box<dyn DavMetaData>);
                 }
 
                 if file_name == "body.md"
@@ -500,7 +616,9 @@ impl DavFileSystem for GmailDav {
                     || file_name == "snippet.txt"
                     || file_name == "metadata.json"
                 {
-                    return Ok(Box::new(GmailDavMetaData::new(false, 1024)) as Box<dyn DavMetaData>);
+                    return Ok(Box::new(GmailDavMetaData::new_with_time(
+                        false, 1024, modified,
+                    )) as Box<dyn DavMetaData>);
                 }
 
                 Err(FsError::NotFound)
@@ -657,11 +775,24 @@ impl DavFileSystem for GmailDav {
 struct GmailDavMetaData {
     is_dir: bool,
     size: u64,
+    modified: SystemTime,
 }
 
 impl GmailDavMetaData {
     fn new(is_dir: bool, size: u64) -> Self {
-        Self { is_dir, size }
+        Self {
+            is_dir,
+            size,
+            modified: SystemTime::now(),
+        }
+    }
+
+    fn new_with_time(is_dir: bool, size: u64, modified: SystemTime) -> Self {
+        Self {
+            is_dir,
+            size,
+            modified,
+        }
     }
 }
 
@@ -670,7 +801,7 @@ impl DavMetaData for GmailDavMetaData {
         self.size
     }
     fn modified(&self) -> FsResult<SystemTime> {
-        Ok(SystemTime::now())
+        Ok(self.modified)
     }
     fn is_dir(&self) -> bool {
         self.is_dir
@@ -680,13 +811,15 @@ impl DavMetaData for GmailDavMetaData {
 struct GmailDavDirEntry {
     name: String,
     is_dir: bool,
+    modified: SystemTime,
 }
 
 impl GmailDavDirEntry {
-    fn new(name: &str, is_dir: bool) -> Self {
+    fn new_with_time(name: &str, is_dir: bool, modified: SystemTime) -> Self {
         Self {
             name: name.to_string(),
             is_dir,
+            modified,
         }
     }
 }
@@ -696,8 +829,14 @@ impl DavDirEntry for GmailDavDirEntry {
         self.name.as_bytes().to_vec()
     }
     fn metadata(&self) -> FsFuture<'_, Box<dyn DavMetaData>> {
-        async move { Ok(Box::new(GmailDavMetaData::new(self.is_dir, 0)) as Box<dyn DavMetaData>) }
-            .boxed()
+        async move {
+            Ok(Box::new(GmailDavMetaData::new_with_time(
+                self.is_dir,
+                0,
+                self.modified,
+            )) as Box<dyn DavMetaData>)
+        }
+        .boxed()
     }
 }
 
@@ -707,6 +846,7 @@ struct GmailDavFile {
     path: DavPath,
     content: Option<Bytes>,
     size: Option<u64>,
+    modified: SystemTime,
     pos: usize,
     write_buffer: Option<Arc<Mutex<Vec<u8>>>>,
 }
@@ -715,12 +855,23 @@ impl DavFile for GmailDavFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         async move {
             if let Some(content) = &self.content {
-                Ok(Box::new(GmailDavMetaData::new(false, content.len() as u64))
-                    as Box<dyn DavMetaData>)
+                Ok(Box::new(GmailDavMetaData::new_with_time(
+                    false,
+                    content.len() as u64,
+                    self.modified,
+                )) as Box<dyn DavMetaData>)
             } else if let Some(size) = self.size {
-                Ok(Box::new(GmailDavMetaData::new(false, size)) as Box<dyn DavMetaData>)
+                Ok(Box::new(GmailDavMetaData::new_with_time(
+                    false,
+                    size,
+                    self.modified,
+                )) as Box<dyn DavMetaData>)
             } else if self.write_buffer.is_some() {
-                Ok(Box::new(GmailDavMetaData::new(false, 0)) as Box<dyn DavMetaData>)
+                Ok(Box::new(GmailDavMetaData::new_with_time(
+                    false,
+                    0,
+                    self.modified,
+                )) as Box<dyn DavMetaData>)
             } else {
                 // If we reach here, we are likely handling a GET request for a file
                 // where we only had a dummy size. We MUST download the real content
@@ -729,7 +880,11 @@ impl DavFile for GmailDavFile {
                 let content = self.dav.get_content_bytes(&self.path).await?;
                 let size = content.len() as u64;
                 self.content = Some(content);
-                Ok(Box::new(GmailDavMetaData::new(false, size)) as Box<dyn DavMetaData>)
+                Ok(Box::new(GmailDavMetaData::new_with_time(
+                    false,
+                    size,
+                    self.modified,
+                )) as Box<dyn DavMetaData>)
             }
         }
         .boxed()

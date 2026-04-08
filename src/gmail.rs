@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use chrono::DateTime;
+use chrono::{DateTime, TimeZone, Utc};
 use google_gmail1::api::Message;
 use google_gmail1::hyper_util::client::legacy::connect::HttpConnector;
 use google_gmail1::hyper_util::client::legacy::Client;
@@ -332,14 +332,24 @@ impl GmailClient {
         let mut date_str = "0000-00-00".to_string();
         let mut subject = "NoSubject".to_string();
 
+        // Use internalDate as primary source for filename date
+        if let Some(internal_date) = msg.internal_date {
+            if let Some(dt) = Utc.timestamp_opt(internal_date / 1000, ((internal_date % 1000) * 1_000_000) as u32).single() {
+                date_str = dt.format("%Y-%m-%d").to_string();
+            }
+        }
+
         if let Some(payload) = &msg.payload {
             if let Some(headers) = &payload.headers {
                 for h in headers {
                     match h.name.as_deref() {
                         Some("Date") => {
-                            if let Some(val) = &h.value {
-                                if let Ok(dt) = DateTime::parse_from_rfc2822(val) {
-                                    date_str = dt.format("%Y-%m-%d").to_string();
+                            // Only use Date header if internal_date wasn't available
+                            if date_str == "0000-00-00" {
+                                if let Some(val) = &h.value {
+                                    if let Ok(dt) = DateTime::parse_from_rfc2822(val) {
+                                        date_str = dt.format("%Y-%m-%d").to_string();
+                                    }
                                 }
                             }
                         }
